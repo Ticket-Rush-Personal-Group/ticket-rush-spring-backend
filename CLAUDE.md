@@ -124,15 +124,15 @@ This is the user's established flow. Follow it as written; do not reorder or ski
    Example: change `add-project-skeleton` → branch `feat/add-project-skeleton`.
 2. **Create the change** — `openspec new change "<name>" --schema spec-driven-custom`, then design → proposal → specs → tasks. **The user approves before any code is written.**
 3. **Mark it in progress** — record the change name and goal in `tasks/todo.md`.
-4. **Implement** — block by block (see Phase 3). Each block: Pre-Change Checklist green → hand the user one commit command → next block.
+4. **Implement** — block by block (see Phase 3). Each block must pass the Pre-Change Checklist before moving on, but **do not commit per block**.
 5. **Archive** — `openspec-archive-change`: merge the change's `specs/` into `openspec/specs/`, move the folder to `openspec/changes/archive/<YYYY-MM-DD>-<name>/`.
 6. **Write lessons** — append to `tasks/lessons.md` **only if a real pitfall was hit**. Nothing hit, nothing written; padding this file destroys its value.
 7. **Update todo** — tick the change off, move any deferred items into the deferred section.
-8. **Wrap-up commit** — archive + lessons + todo in one commit.
+8. **Commit — one commit per change.** Implementation, archive, lessons, and todo all go into a single commit. Not one per block, not one per file.
 9. **Push** — the user pushes the branch.
 10. **Merge on GitHub** — PR into `develop`.
 
-Steps 4 and 8 both produce commits: step 4 is **per-block during implementation**, step 8 is a **single wrap-up commit**. Never run `git commit` / `git push` yourself at either — always hand the command to the user.
+**Only step 8 produces a commit.** Blocks are units of verification, not units of commit — a block going green means "safe to continue", not "time to commit". Never run `git commit` / `git push` yourself — always hand the command to the user.
 
 ### Phase 1 — Explore & Design
 
@@ -152,7 +152,7 @@ Steps 4 and 8 both produce commits: step 4 is **per-block during implementation*
 
 - Use `openspec-apply` to work task by task.
 - For service / use case implementation use `superpowers:test-driven-development`.
-- **Work in blocks**: each block must build and verify independently. Never leave a non-compiling intermediate state. Each block: run the Pre-Change Checklist green → give one commit command (the user runs it) → next block.
+- **Work in blocks**: each block must build and verify independently. Never leave a non-compiling intermediate state. Each block: run the Pre-Change Checklist green → next block. **No commit between blocks** — blocks are units of verification, not units of commit.
 - Before marking a task done, use `superpowers:verification-before-completion` — never claim "done" without running the verification command and showing its output.
 - **Concurrency tests need reverse verification.** A concurrency test can be permanently green for the wrong reason (e.g. the threads never actually started simultaneously). Deliberately break the production code, watch it turn red, restore, confirm `git status` is clean.
 
