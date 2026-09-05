@@ -74,3 +74,15 @@
 **Why:** Maven 中 **pom 的明確設定值優先於命令列的 user property**。`-DexcludedGroups=` 覆蓋不掉 pom 的值,於是 `groups`(只選這個 tag)與 `excludedGroups`(排除這個 tag)同時套用,交集為空。而它不會報錯 —— 只是安靜地跑了 0 個測試。
 
 **How to apply:** 需要被命令列覆蓋的 plugin 參數,一律寫成 `${property.name}` 佔位並在 `<properties>` 給預設值,而不是寫死。`Tests run: 0` 且 `BUILD SUCCESS` 是個危險組合,**它看起來跟「測試通過」很像** —— 執行測試後要確認實際跑了幾個。
+
+---
+
+### 2026-09-06 — `docker compose run` 會靜默替換掉 depends_on 的服務
+
+**踩到什麼:** 以 `VIRTUAL_THREADS=true docker compose up -d --force-recreate app` 重建應用來啟用虛擬執行緒,並確認容器內的環境變數確實是 `true`。接著執行壓測腳本,腳本內的 `docker compose run --rm k6` 跑完後,**應用又變回平台執行緒**。連續兩次,兩組「對照數據」其實都是平台執行緒。
+
+**Why:** `docker compose run` 會依**當前解析到的設定**比對 `depends_on` 的服務,不一致就重建它。壓測腳本執行時環境中沒有 `VIRTUAL_THREADS`,compose 解析成預設的 `false`,於是把正在跑虛擬執行緒的容器替換掉。**沒有任何錯誤、警告或提示。**
+
+**How to apply:** 給 `docker compose run` 加 `--no-deps`,或確保腳本內外的環境變數一致。
+
+**更根本的一課:讓被測系統自己報告它當前的設定。** 這個問題是靠應用啟動時輸出的 `availableProcessors` / heap / 執行緒模型抓到的 —— 若測量條件是由人抄寫 compose 設定,抄到的會是「設定值」而不是「實際值」,而兩者不一致正是最需要被發現的情況。**任何跨組比較的實驗,都該讓被測系統自報條件。**
