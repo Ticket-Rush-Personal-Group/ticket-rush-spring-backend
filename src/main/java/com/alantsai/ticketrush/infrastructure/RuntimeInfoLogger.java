@@ -1,6 +1,8 @@
 package com.alantsai.ticketrush.infrastructure;
 
 import com.alantsai.ticketrush.application.facade.StrategyRegistry;
+import com.zaxxer.hikari.HikariDataSource;
+import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
@@ -27,10 +29,12 @@ public class RuntimeInfoLogger implements ApplicationRunner {
 
     private final Environment environment;
     private final StrategyRegistry strategyRegistry;
+    private final DataSource dataSource;
 
-    public RuntimeInfoLogger(Environment environment, StrategyRegistry strategyRegistry) {
+    public RuntimeInfoLogger(Environment environment, StrategyRegistry strategyRegistry, DataSource dataSource) {
         this.environment = environment;
         this.strategyRegistry = strategyRegistry;
+        this.dataSource = dataSource;
     }
 
     @Override
@@ -45,13 +49,28 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 ===== 執行環境(壓測測量條件的來源) =====
                 availableProcessors : {}
                 maxMemory (heap)    : {} MB
+                連線池上限          : {}
                 虛擬執行緒          : {}
                 當前策略            : {}
                 ==========================================
                 """,
                 runtime.availableProcessors(),
                 runtime.maxMemory() / BYTES_PER_MB,
+                maxPoolSize(),
                 virtualThreads ? "啟用" : "停用(平台執行緒)",
                 strategyRegistry.current());
+    }
+
+    /**
+     * 連線池上限。
+     *
+     * <p>從 DataSource 實例讀取而非讀設定值 —— 與 CPU / heap 同樣的理由:
+     * 要報告的是**實際生效的值**,設定被覆蓋或未生效時才看得出來。
+     */
+    private String maxPoolSize() {
+        if (dataSource instanceof HikariDataSource hikari) {
+            return String.valueOf(hikari.getMaximumPoolSize());
+        }
+        return "未知(非 HikariCP:" + dataSource.getClass().getSimpleName() + ")";
     }
 }

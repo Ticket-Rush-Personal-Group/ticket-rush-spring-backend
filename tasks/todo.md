@@ -12,7 +12,7 @@
       **超賣證據已取得:1000 併發搶 500 張,售出 1000 張、庫存只減少 144,超賣 856 張**(READ COMMITTED、未套資源限制)。這是 README 的開場數據
 - [x] 4. `add-load-test-harness` —— **完成**(分支 `feat/add-load-test-harness`)。Dockerfile + compose `perf` profile + k6 腳本 + RuntimeInfoLogger。資源限制經反向驗證確實生效(cpus 4→2 時 JVM 報告跟著變)。第 0 層基準數據已取得:平台執行緒 p99 932.59ms / 超賣 862 張,虛擬執行緒 p99 872.88ms / 超賣 884 張
 - [x] 5. `add-purchase-limit-policy` —— **完成**(分支 `feat/add-purchase-limit-policy`)。一人一場限購上限。限購規則置於 domain 且可純單元測試驗證,檢查順序為先限購後庫存。`./mvnw verify` 綠,82 個測試。**第二組證據已取得:20 個併發請求下超買 6 張**(上限 4)
-- [ ] 6. `add-pessimistic-lock-strategy` —— 驗收:零超賣 + 鎖等待與連線池飽和點數據
+- [x] 6. `add-pessimistic-lock-strategy` —— **完成**。第一個正確的實作。限購採「鎖前快篩 + 鎖後權威檢查」雙重檢查。`./mvnw verify` 綠,85 個測試(含兩個併發正確性**驗收**測試)。**零超賣、零超買;吞吐 693.76 req/s(無鎖同條件 827.58,-16%)。連線池對照判定瓶頸在連線池而非鎖(10→50 提升 36%)**
 - [ ] 7. `add-optimistic-lock-strategy` —— 驗收:零超賣 + 重試次數分佈
 - [ ] 8. `add-redis-prededuct-strategy` —— 驗收:零超賣 + 對帳收斂 + 注入落庫失敗後補償有效
 
@@ -24,6 +24,9 @@
 - [ ] 限購上限的實際張數 —— 暫定 4 張,壓測時可調整以觀察對競爭的影響
 
 ## 延後
+
+- **跨列鎖的順序** —— 目前只鎖單一庫存列,不會死鎖。若日後出現需要同時鎖多列的情境
+  (例如跨場次套票),必須先定義鎖的取得順序,否則會死鎖
 
 - **已取消訂單應排除於限購計算** —— 目前 `SUM(quantity)` 不篩選狀態。Phase 2 引入逾時取消後,
   已取消的訂單不應繼續佔用使用者的限購額度。現在只有 PENDING 狀態,該邏輯無法驗證,故不預先實作

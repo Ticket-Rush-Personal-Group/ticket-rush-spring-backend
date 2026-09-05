@@ -31,7 +31,12 @@ public class TestcontainersConfiguration {
     // Testcontainers 2.x 的 org.testcontainers.postgresql.PostgreSQLContainer 不是泛型類別
     // (1.x 在 org.testcontainers.containers 底下是自遞迴泛型 PostgreSQLContainer<SELF>)。
     // 寫 <> 會編譯失敗:「非泛型類別不能使用 '<>'」。
-    private static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17");
+    // max_connections 提高至 300：Spring 的 context 快取會保留多個 context，
+    // 每個 context 各有一個連線池（上限 50）。三個以上的 context 就會超過
+    // PostgreSQL 預設的 100，症狀是「某些測試偶發連不上資料庫」——
+    // 而它看起來像不穩定的測試，不像設定問題。
+    private static final PostgreSQLContainer POSTGRES =
+            new PostgreSQLContainer("postgres:17").withCommand("postgres", "-c", "max_connections=300");
 
     @Bean
     @ServiceConnection

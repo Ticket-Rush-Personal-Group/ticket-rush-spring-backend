@@ -9,6 +9,16 @@ spring:
     username: postgres
     # 密碼不寫死。值來自 ~/dev-databases/.env 的 POSTGRES_PASSWORD,見 .env.example
     password: ${DEV_DB_PASSWORD:}
+    hikari:
+      # 原本完全沒有設定，用的是預設值 10。
+      #
+      # 這個數字對需要鎖的策略是決定性的：悲觀鎖會延長交易，而交易期間連線被佔用。
+      # 1000 併發下若只有 10 個連線，最多 10 個請求真的在等鎖，其餘 990 個在等連線——
+      # 量到的會是排隊延遲而非鎖競爭，而兩者在延遲圖表上長得一模一樣。
+      #
+      # 50 遠低於資料庫的 max_connections=500（壓測環境），不會撞到資料庫端上限。
+      # **此值必須納入壓測的測量條件**：它會影響所有策略的數據。
+      maximum-pool-size: 50
 
   jpa:
     hibernate:
