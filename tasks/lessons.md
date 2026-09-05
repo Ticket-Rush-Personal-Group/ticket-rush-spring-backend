@@ -52,3 +52,25 @@
 **Why:** context 快取的分組依據是註解與設定的組合,不是類別數量。只要有測試類別的設定組合不同,`@Bean` 就會被呼叫多次。
 
 **How to apply:** 容器以 `private static final` 欄位持有,`@Bean` 方法只回傳該實例 —— static 初始化每個 JVM 只執行一次,不受 context 數量影響。**驗證方式:`./mvnw verify 2>&1 | grep -c "Creating container for image"`,數字應為 1。** 改成 static 後 `ActuatorHealthTest` 的耗時從 1.65s 降到 0.28s。
+
+---
+
+### 2026-09-06 — `synchronized` 救不了 `@Transactional` 方法
+
+**踩到什麼:** 為了反向驗證超賣測試,在 `@Transactional` 的 `purchase` 方法上加 `synchronized`,預期超賣會消失。**實際上仍然超賣 47 張**,測試沒有變紅。
+
+**Why:** **鎖的範圍比交易的範圍小。** `@Transactional` 由 AOP proxy 實作 —— proxy 先開交易、再呼叫方法、方法返回後才提交。`synchronized` 只涵蓋方法本體,執行緒 A 離開同步區塊時交易**尚未提交**,執行緒 B 立刻進入並讀到舊值。鎖釋放了,但資料還沒可見。
+
+**How to apply:** 需要互斥時,鎖必須在交易之外(或改用資料庫層級的鎖:`SELECT ... FOR UPDATE`、條件式 UPDATE、提高隔離級別)。**任何「在 service 方法加 synchronized 就安全了」的說法都是錯的**,而它錯得很安靜 —— 併發量小的時候完全看不出來。
+
+實測對照(1000 併發搶 500 張):無鎖超賣 865 張;加 `synchronized` 仍超賣 47 張;改 `SERIALIZABLE` 隔離級別超賣 0,但 822/1000 的請求被拒。
+
+---
+
+### 2026-09-06 — surefire 的 excludedGroups 寫死就覆蓋不掉
+
+**踩到什麼:** 在 `pom.xml` 的 surefire plugin 內寫死 `<excludedGroups>overselling-evidence</excludedGroups>`,想單獨執行時下 `-DexcludedGroups= -Dgroups=overselling-evidence`,結果是 **`Tests run: 0`**。
+
+**Why:** Maven 中 **pom 的明確設定值優先於命令列的 user property**。`-DexcludedGroups=` 覆蓋不掉 pom 的值,於是 `groups`(只選這個 tag)與 `excludedGroups`(排除這個 tag)同時套用,交集為空。而它不會報錯 —— 只是安靜地跑了 0 個測試。
+
+**How to apply:** 需要被命令列覆蓋的 plugin 參數,一律寫成 `${property.name}` 佔位並在 `<properties>` 給預設值,而不是寫死。`Tests run: 0` 且 `BUILD SUCCESS` 是個危險組合,**它看起來跟「測試通過」很像** —— 執行測試後要確認實際跑了幾個。

@@ -28,6 +28,12 @@
 	</scm>
 	<properties>
 		<java.version>21</java.version>
+		<!--
+			以 property 佔位而非在 plugin 內寫死。Maven 中 pom 的明確設定值優先於命令列的
+			user property，寫死之後 -DexcludedGroups= 覆蓋不掉，單獨執行超賣測試會得到
+			「Tests run: 0」——groups 與 excludedGroups 同時套用，交集為空。
+		-->
+		<surefire.excludedGroups>overselling-evidence</surefire.excludedGroups>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -113,6 +119,20 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<!--
+						超賣證據測試預設排除。它是刻意呈現錯誤行為的測試，不該阻斷一般建置。
+						刻意不用 @Disabled：那在報告中顯示為 skipped，外觀等同「壞了還沒修」，
+						幾個月後很可能被人順手「修好」——而那會消滅本專案的開場數據。
+
+						單獨執行：./mvnw test -Dsurefire.excludedGroups= -Dgroups=overselling-evidence
+					-->
+					<excludedGroups>${surefire.excludedGroups}</excludedGroups>
+				</configuration>
 			</plugin>
 			<plugin>
 				<groupId>com.diffplug.spotless</groupId>

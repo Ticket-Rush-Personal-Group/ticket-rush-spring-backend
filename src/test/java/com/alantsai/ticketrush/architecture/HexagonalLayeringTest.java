@@ -1,6 +1,7 @@
 package com.alantsai.ticketrush.architecture;
 
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noFields;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noMethods;
 import static com.tngtech.archunit.library.Architectures.layeredArchitecture;
 
@@ -26,6 +27,8 @@ class HexagonalLayeringTest {
     private static final String SPRING_TRANSACTIONAL = "org.springframework.transaction.annotation.Transactional";
     private static final String SPRING_CROSS_ORIGIN = "org.springframework.web.bind.annotation.CrossOrigin";
     private static final String JPA_ENTITY = "jakarta.persistence.Entity";
+    private static final String PURCHASE_TICKET_USE_CASE =
+            "com.alantsai.ticketrush.application.port.in.PurchaseTicketUseCase";
 
     private static final String PERSISTENCE_PACKAGE = "..adapter.out.persistence..";
     private static final String WEB_PACKAGE = "..adapter.in.web..";
@@ -119,4 +122,24 @@ class HexagonalLayeringTest {
             .dependOnClassesThat()
             .areAnnotatedWith(JPA_ENTITY)
             .because("entity 是持久化的實作細節,外洩會讓 JPA 的行為擴散到 application 與 domain");
+
+    /**
+     * R6:{@code PurchaseTicketUseCase} 不得被單獨注入。
+     *
+     * <p>以「欄位型別」判定即可涵蓋建構子注入 —— 建構子參數最終都會賦值給欄位。
+     * 這同時擋下 {@code @Qualifier} 繞過:即使指定了特定實作,欄位型別仍是該介面。
+     *
+     * <p><b>本規則真正要防的不是啟動失敗。</b> 單純的單一注入本來就會拋
+     * {@code NoUniqueBeanDefinitionException},不需要守則。要防的是有人以 {@code @Qualifier}
+     * 或 {@code @Primary} 讓它「能動」—— 那會讓某個類別直接綁定特定策略,
+     * 策略不再可自由抽換,而且**不會有任何錯誤訊息**。
+     *
+     * <p>{@code PurchaseFacade} 注入的是 {@code Map<String, PurchaseTicketUseCase>},
+     * 欄位型別為 Map,因此不受本規則影響 —— 集合注入是唯一允許的取用方式。
+     */
+    @ArchTest
+    static final ArchRule purchaseUseCaseIsNeverInjectedDirectly = noFields()
+            .should()
+            .haveRawType(PURCHASE_TICKET_USE_CASE)
+            .because("直接持有單一策略會讓該類別綁定特定實作,「同一個 API、四種實作」的前提就不成立了");
 }

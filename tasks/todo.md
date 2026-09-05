@@ -8,7 +8,8 @@
 
 - [x] 1. `add-project-skeleton` —— **完成**。Maven + Spring Boot 4.1.1 + 六角目錄(14 個 package)+ ArchUnit guardrail(4 個 `@ArchTest`,各自經反向驗證)+ Spotless。`./mvnw verify` 綠,6 個測試通過
 - [x] 2. `add-domain-model` —— **完成**。Flyway V1 三張表、domain model 與 value object、JPA entity 與手寫 mapper、三個基本 out port 與 persistence adapter、Testcontainers 整合測試。從第 1 支延後的兩條 ArchUnit 規則已補上並各自反向驗證(共 7 條規則)。`./mvnw verify` 綠,37 個測試
-- [ ] 3. `add-purchase-api-no-lock` —— 購票 API + `PurchaseFacade` + 第 0 層無鎖實作 + **刻意紅的超賣測試**。驗收:API 可用,且超賣測試證明問題存在
+- [x] 3. `add-purchase-api-no-lock` —— **完成**。購票 API、`PurchaseFacade` 與策略選擇、第 0 層無鎖實作、統一 API wrapper 與錯誤映射、最後一條延後的 ArchUnit 規則(共 8 條)。`./mvnw verify` 綠,55 個測試。
+      **超賣證據已取得:1000 併發搶 500 張,售出 1000 張、庫存只減少 144,超賣 856 張**(READ COMMITTED、未套資源限制)。這是 README 的開場數據
 - [ ] 4. `add-load-test-harness` —— k6 腳本 + compose `perf` profile。驗收:量得到第 0 層的超賣數據(README 的開場圖)
 - [ ] 5. `add-purchase-limit-policy` —— 一人一場限購上限。驗收:同一人並發請求擋得住
 - [ ] 6. `add-pessimistic-lock-strategy` —— 驗收:零超賣 + 鎖等待與連線池飽和點數據

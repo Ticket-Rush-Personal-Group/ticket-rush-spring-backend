@@ -119,10 +119,12 @@ TBD - created by archiving change add-project-skeleton. Update Purpose after arc
 | 分層依賴方向 | ArchUnit | 第 1 支 |
 | domain 無框架依賴 | ArchUnit | 第 1 支 |
 | 禁用 `@CrossOrigin` | ArchUnit | 第 1 支 |
-| `@Transactional` 位置 | ArchUnit | **第 2 支(已納入)** |
-| JPA entity 不外洩 persistence | ArchUnit | **第 2 支(已納入)** |
-| 禁止單獨注入 `PurchaseTicketUseCase` | ArchUnit | 第 3 支(該介面出現時) |
+| `@Transactional` 位置 | ArchUnit | 第 2 支(已納入) |
+| JPA entity 不外洩 persistence | ArchUnit | 第 2 支(已納入) |
+| 禁止單獨注入 `PurchaseTicketUseCase` | ArchUnit | **第 3 支(已納入)** |
 | `@Transactional` self-invocation 失效 | **〔自律〕** | 永遠 —— 見下方 scenario |
+
+**延後的規則至此全數到期。** 三條規則各自等到「被守護的對象存在」才納入,期間的空窗由文件與本表格記錄 —— 沒有任何一條是被遺忘的。
 
 #### Scenario: 約束無法自動化
 
@@ -167,4 +169,32 @@ entity 一旦外洩到 application 或 domain,持久化的細節就跟著擴散:
 
 - **WHEN** 某個標註 `@Entity` 的類別未以 `JpaEntity` 結尾,且被外層依賴
 - **THEN** ArchUnit 測試 SHALL 仍然失敗 —— 判定依據是註解而非名稱
+
+### Requirement: 禁止單獨注入 PurchaseTicketUseCase
+
+`PurchaseTicketUseCase` MUST NOT 被單獨注入。取用途徑 MUST 為 `PurchaseFacade` 持有的 `Map<String, PurchaseTicketUseCase>`。
+
+同一介面存在多個實作時,單一注入點會在 Spring context 啟動階段拋出 `NoUniqueBeanDefinitionException`。本規則的價值不在於避免那個錯誤 —— 它本來就會炸 —— 而在於**防止有人以 `@Qualifier` 或 `@Primary` 繞過它**:那會讓某個 controller 或 service 直接綁定特定策略,策略便不再可自由抽換,「同一個 API、四種實作」這項前提就被破壞了,而且不會有任何錯誤訊息。
+
+策略的選擇 MUST 封裝於 facade 之內,MUST NOT 洩漏至 adapter 層。
+
+#### Scenario: 於 application service 單獨注入
+
+- **WHEN** `application.service` 的類別以建構子或欄位注入 `PurchaseTicketUseCase`
+- **THEN** ArchUnit 測試 SHALL 失敗
+
+#### Scenario: 於 web adapter 單獨注入
+
+- **WHEN** `adapter.in.web` 的 controller 注入 `PurchaseTicketUseCase`
+- **THEN** ArchUnit 測試 SHALL 失敗 —— controller 只能依賴 `PurchaseFacade`
+
+#### Scenario: 以 Qualifier 指定特定策略
+
+- **WHEN** 任何類別以 `@Qualifier` 注入特定的 `PurchaseTicketUseCase` 實作
+- **THEN** ArchUnit 測試 SHALL 失敗 —— 這正是本規則要防的繞過方式
+
+#### Scenario: facade 持有策略集合
+
+- **WHEN** `PurchaseFacade` 注入 `Map<String, PurchaseTicketUseCase>`
+- **THEN** ArchUnit 測試 SHALL 通過 —— 集合注入是唯一允許的取用方式
 
