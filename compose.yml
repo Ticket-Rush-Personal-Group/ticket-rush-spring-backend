@@ -39,6 +39,9 @@ services:
       # 啟動時設定，無法於執行期切換——這是「啟動兩次跑八組」的原因
       SPRING_THREADS_VIRTUAL_ENABLED: "${VIRTUAL_THREADS:-false}"
       TICKET_RUSH_STRATEGY: "${STRATEGY:-noLock}"
+      # 連線池大小可由外部覆寫，用於「等鎖 vs 等連線」的對照實驗。
+      # 兩者在延遲圖表上長得一模一樣，改變連線池是最直接的區分方式。
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-50}"
     healthcheck:
       # 打真正的端點，不檢查行程或埠：容器 running 與「可接受請求」之間有實質空窗
       # （JVM 啟動 → Flyway migration → context 初始化完成）。

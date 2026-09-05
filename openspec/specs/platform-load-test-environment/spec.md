@@ -78,7 +78,9 @@ TBD - created by archiving change add-load-test-harness. Update Purpose after ar
 
 ### Requirement: 每組效能數據必須附帶完整的測量條件
 
-任何被記錄或引用的效能數字 MUST 同時包含:策略名稱、執行緒模型(平台 / 虛擬)、容器 CPU 與記憶體限制、JVM 實際觀察到的處理器數、`max_connections`、k6 的 VU 數與請求模式、初始庫存量。
+任何被記錄或引用的效能數字 MUST 同時包含:策略名稱、執行緒模型(平台 / 虛擬)、容器 CPU 與記憶體限制、JVM 實際觀察到的處理器數、**應用端的連線池大小**、資料庫的 `max_connections`、k6 的 VU 數與請求模式、初始庫存量。
+
+**連線池大小是後加入的必要欄位。** 需要鎖的策略會延長交易,而交易期間連線被佔用 —— 連線池因此可能成為比鎖更早出現的瓶頸。少了這個欄位,「加鎖之後變慢了」這個結論會無法判斷究竟是鎖造成的,還是連線池造成的,而兩者的處置方式完全不同。
 
 **沒有測量條件的數字無法與另一個比較。** 在一個以比較為唯一產出的專案裡,那等於沒有數據。
 
@@ -92,7 +94,11 @@ TBD - created by archiving change add-load-test-harness. Update Purpose after ar
 - **WHEN** 兩組數據的資源限制不同
 - **THEN** 它們 SHALL NOT 被並列比較,即使量測項目相同
 
----
+#### Scenario: 連線池大小不同的兩組數據
+
+- **WHEN** 兩組數據的連線池大小不同
+- **THEN** 它們 SHALL NOT 被用來論證策略之間的差異 —— 差異可能來自連線池而非策略
+- **AND** 刻意改變連線池以定位瓶頸時,該對照 MUST 明確標示為「連線池對照」而非「策略對照」
 
 ### Requirement: 八組數據的取得流程
 
