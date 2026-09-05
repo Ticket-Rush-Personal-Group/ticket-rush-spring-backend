@@ -98,10 +98,12 @@ class PurchaseControllerIntegrationTest {
     void insufficientStock() throws Exception {
         long eventId = givenEventWithStock(1);
 
+        // 買 2 張而非 5 張：限購上限為 4，且限購檢查在庫存之前——
+        // 買 5 張會先被 PURCHASE_LIMIT_EXCEEDED 擋下，測不到庫存不足這條路徑。
         mockMvc.perform(post("/api/events/{id}/purchase", eventId)
                         .header("X-User-Id", 1L)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(5, "key-002")))
+                        .content(body(2, "key-002")))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.code").value("INSUFFICIENT_STOCK"))
