@@ -3,6 +3,7 @@ package com.alantsai.ticketrush.adapter.in.web;
 import com.alantsai.ticketrush.adapter.in.web.dto.ApiErrorResponse;
 import com.alantsai.ticketrush.domain.exception.EventNotFoundException;
 import com.alantsai.ticketrush.domain.exception.InsufficientStockException;
+import com.alantsai.ticketrush.domain.exception.PurchaseLimitExceededException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -31,6 +32,12 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiErrorResponse> handleEventNotFound(EventNotFoundException e) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ApiErrorResponse.of(ErrorCode.EVENT_NOT_FOUND, e.getMessage()));
+    }
+
+    @ExceptionHandler(PurchaseLimitExceededException.class)
+    ResponseEntity<ApiErrorResponse> handlePurchaseLimitExceeded(PurchaseLimitExceededException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiErrorResponse.of(ErrorCode.PURCHASE_LIMIT_EXCEEDED, e.getMessage()));
     }
 
     @ExceptionHandler(InsufficientStockException.class)

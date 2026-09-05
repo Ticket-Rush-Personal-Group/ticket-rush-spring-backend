@@ -1,8 +1,48 @@
-# api-ticket-purchase Specification
+## ADDED Requirements
 
-## Purpose
-TBD - created by archiving change add-purchase-api-no-lock. Update Purpose after archive.
-## Requirements
+### Requirement: 單人購買量上限
+
+系統 SHALL 限制同一使用者在同一場次的累計購買張數。上限值 MUST 可設定,預設為 4 張。
+
+**計算單位是張數而非訂單筆數** —— 一次買 4 張與四次各買 1 張,對限購而言等價。已購張數以該使用者在該場次所有訂單的 `SUM(quantity)` 計算。
+
+檢查 MUST 在讀取庫存**之前**執行。限購檢查只需一次索引查詢,庫存檢查則會進入鎖競爭 —— 把便宜的檢查放前面,被限購擋下的請求就不必參與競爭。在有鎖的策略中,這個順序決定了多少請求會真正去搶那把鎖。
+
+限購規則 MUST 定義於 domain 層且能以純單元測試驗證,MUST NOT 依賴資料庫約束或框架。
+
+#### Scenario: 累計未超過上限
+
+- **WHEN** 使用者在該場次已購 2 張,再購買 2 張(上限 4)
+- **THEN** 回應 `201`,訂單成立
+
+#### Scenario: 累計超過上限
+
+- **WHEN** 使用者在該場次已購 3 張,再購買 2 張(上限 4)
+- **THEN** 回應 `409` 且 `code` 為 `PURCHASE_LIMIT_EXCEEDED`
+- **AND** 不建立訂單,**且不扣減庫存** —— 限購檢查在庫存之前,被擋下的請求不應影響庫存
+
+#### Scenario: 單次請求即超過上限
+
+- **WHEN** 使用者尚未購買,一次請求 5 張(上限 4)
+- **THEN** 回應 `409` 且 `code` 為 `PURCHASE_LIMIT_EXCEEDED`
+
+#### Scenario: 限購以張數而非訂單數計算
+
+- **WHEN** 使用者已有 4 筆各 1 張的訂單(上限 4),再購買 1 張
+- **THEN** 回應 `409` —— 判定依據是累計 4 張,不是「只有 4 筆訂單」
+
+#### Scenario: 限購為每場次獨立
+
+- **WHEN** 使用者在 A 場次已購滿 4 張,對 B 場次購買 1 張
+- **THEN** 回應 `201` —— 上限是「每人每場次」,不是「每人全站」
+
+#### Scenario: 領域規則可獨立驗證
+
+- **WHEN** 以純單元測試(不啟動 Spring、不連資料庫)驗證限購規則
+- **THEN** 測試 SHALL 能執行並涵蓋通過與超限兩種情況
+
+## MODIFIED Requirements
+
 ### Requirement: 購票
 
 `POST /api/events/{eventId}/purchase`
@@ -89,56 +129,3 @@ TBD - created by archiving change add-purchase-api-no-lock. Update Purpose after
 
 - **WHEN** 某請求同時超過限購上限且庫存不足
 - **THEN** 回應 SHALL 為 `PURCHASE_LIMIT_EXCEEDED` —— 限購檢查在庫存之前
-
-### Requirement: 購票端點不得暴露當前策略
-
-回應 MUST NOT 包含當前使用哪一種併發策略的資訊。策略的選擇 MUST 封裝於 `PurchaseFacade` 之內。
-
-四層策略是同一契約的不同實作。若回應洩漏策略名稱,呼叫端就可能依它分支,策略便不再可自由抽換 —— 那會摧毀「同一個 API、四種實作」這項前提。
-
-#### Scenario: 切換策略不改變回應形狀
-
-- **WHEN** 當前策略由一種切換為另一種
-- **THEN** 相同請求的成功回應形狀 SHALL 完全相同,不含任何策略識別資訊
-
-### Requirement: 單人購買量上限
-
-系統 SHALL 限制同一使用者在同一場次的累計購買張數。上限值 MUST 可設定,預設為 4 張。
-
-**計算單位是張數而非訂單筆數** —— 一次買 4 張與四次各買 1 張,對限購而言等價。已購張數以該使用者在該場次所有訂單的 `SUM(quantity)` 計算。
-
-檢查 MUST 在讀取庫存**之前**執行。限購檢查只需一次索引查詢,庫存檢查則會進入鎖競爭 —— 把便宜的檢查放前面,被限購擋下的請求就不必參與競爭。在有鎖的策略中,這個順序決定了多少請求會真正去搶那把鎖。
-
-限購規則 MUST 定義於 domain 層且能以純單元測試驗證,MUST NOT 依賴資料庫約束或框架。
-
-#### Scenario: 累計未超過上限
-
-- **WHEN** 使用者在該場次已購 2 張,再購買 2 張(上限 4)
-- **THEN** 回應 `201`,訂單成立
-
-#### Scenario: 累計超過上限
-
-- **WHEN** 使用者在該場次已購 3 張,再購買 2 張(上限 4)
-- **THEN** 回應 `409` 且 `code` 為 `PURCHASE_LIMIT_EXCEEDED`
-- **AND** 不建立訂單,**且不扣減庫存** —— 限購檢查在庫存之前,被擋下的請求不應影響庫存
-
-#### Scenario: 單次請求即超過上限
-
-- **WHEN** 使用者尚未購買,一次請求 5 張(上限 4)
-- **THEN** 回應 `409` 且 `code` 為 `PURCHASE_LIMIT_EXCEEDED`
-
-#### Scenario: 限購以張數而非訂單數計算
-
-- **WHEN** 使用者已有 4 筆各 1 張的訂單(上限 4),再購買 1 張
-- **THEN** 回應 `409` —— 判定依據是累計 4 張,不是「只有 4 筆訂單」
-
-#### Scenario: 限購為每場次獨立
-
-- **WHEN** 使用者在 A 場次已購滿 4 張,對 B 場次購買 1 張
-- **THEN** 回應 `201` —— 上限是「每人每場次」,不是「每人全站」
-
-#### Scenario: 領域規則可獨立驗證
-
-- **WHEN** 以純單元測試(不啟動 Spring、不連資料庫)驗證限購規則
-- **THEN** 測試 SHALL 能執行並涵蓋通過與超限兩種情況
-

@@ -23,6 +23,9 @@ spring:
 # Phase 2 的管理介面才開放執行期切換(StrategyRegistry 以 volatile 持有)。
 ticket-rush:
   strategy: noLock
+  # 單人單場次的限購上限。不寫死在 domain：壓測時調整它會改變競爭形態——
+  # 上限越低，被限購擋下的請求越多，真正進入鎖競爭的就越少。
+  max-tickets-per-user: 4
 
 management:
   endpoints:
