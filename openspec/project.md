@@ -37,7 +37,7 @@
 | 層 | 選型 |
 | --- | --- |
 | 語言 | Java 21(虛擬執行緒為實驗維度之一) |
-| 框架 | Spring Boot 3.x |
+| 框架 | Spring Boot 4.1.1 |
 | 建置 | Maven |
 | DB | PostgreSQL 17 |
 | Migration | Flyway |

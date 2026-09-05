@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: ticket-rush
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露 health。env / configprops / heapdump 會洩漏設定與記憶體內容,
+        # 而本專案之後要 public。第 4 支的 compose healthcheck 會打這個端點。
+        include: health

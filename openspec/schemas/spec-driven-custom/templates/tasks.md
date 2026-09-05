@@ -2,7 +2,7 @@
 > `./mvnw compile && ./mvnw spotless:check && ./mvnw test`
 > 動到持久化 / 鎖 / 交易邊界再加 `./mvnw verify`（Testcontainers 整合測試）；
 > 動到策略實作再加該層的 k6 壓測，並連同測量條件一起記錄。
-> 綠燈後給 commit 指令，由使用者手動執行，再進下一塊。
+> 每塊綠燈才進下一塊。**不逐塊 commit** —— 一支 change 只有一個 commit，收尾塊才給指令。
 >
 > <!-- 交代塊與塊的依賴：哪幾塊互相獨立可先做、哪一塊是動 production code 前的安全網不可跳過。
 >      例：塊 1～2 為 A 功能，與塊 3～4 獨立，可先做；塊 3 是改寄信前的 characterization test，不可跳過。 -->

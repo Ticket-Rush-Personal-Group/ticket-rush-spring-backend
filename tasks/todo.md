@@ -6,8 +6,9 @@
 
 依序執行,每支一條 branch(從 `develop` 切)。切塊標準是能否獨立通過驗證鏈。
 
-- [ ] 1. `add-project-skeleton` —— Maven + Spring Boot 3 + 六角目錄 + ArchUnit guardrail + Spotless。驗收:`./mvnw verify` 綠
-- [ ] 2. `add-domain-model` —— Flyway migration + Event / Stock / Order domain model + JPA entity + mapper + out port 定義。驗收:Testcontainers 整合測試綠
+- [x] 1. `add-project-skeleton` —— **完成**。Maven + Spring Boot 4.1.1 + 六角目錄(14 個 package)+ ArchUnit guardrail(4 個 `@ArchTest`,各自經反向驗證)+ Spotless。`./mvnw verify` 綠,6 個測試通過
+- [ ] 2. `add-domain-model` —— Flyway migration + Event / Stock / Order domain model + JPA entity + mapper + out port 定義。驗收:Testcontainers 整合測試綠。
+      **必須補上兩條從第 1 支延後的 ArchUnit 規則**:`@Transactional` 位置(spring-data-jpa 會帶入 spring-tx,屆時註解類別才存在)、JPA entity 不得外洩 `adapter.out.persistence`。兩條都要做反向驗證
 - [ ] 3. `add-purchase-api-no-lock` —— 購票 API + `PurchaseFacade` + 第 0 層無鎖實作 + **刻意紅的超賣測試**。驗收:API 可用,且超賣測試證明問題存在
 - [ ] 4. `add-load-test-harness` —— k6 腳本 + compose `perf` profile。驗收:量得到第 0 層的超賣數據(README 的開場圖)
 - [ ] 5. `add-purchase-limit-policy` —— 一人一場限購上限。驗收:同一人並發請求擋得住
