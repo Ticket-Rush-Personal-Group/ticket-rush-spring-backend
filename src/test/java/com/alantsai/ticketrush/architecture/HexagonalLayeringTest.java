@@ -14,18 +14,21 @@ import com.tngtech.archunit.lang.ArchRule;
  *
  * <p>對應 spec:{@code platform-hexagonal-layering}。
  *
- * <p>註解以字串形式指定而非 class 參考,讓守則得以先於相依存在 —— 這是「守則要先於被守護的
- * 程式碼」的實際做法。
+ * <p>註解以字串 FQN 指定而非 class 參考,讓守則得以先於相依存在 —— 這是「守則要先於被守護的
+ * 程式碼」的實際做法,第 1 支即以此建立。
  *
- * <p><b>@Transactional 的位置守則不在此處</b>:spring-tx 目前不在 classpath(相依只有
- * webmvc / validation / actuator),連違規樣本都造不出來,因此無法反向驗證。依 design 的 D2,
- * 該規則延後至第 2 支 {@code add-domain-model} —— 屆時 spring-data-jpa 會帶入 spring-tx。
- * 留下一條無法驗證的守則,比沒有守則更危險。
+ * <p>每一條規則都經過反向驗證:造出違規樣本、確認該條變紅、移除樣本。**綠燈不是規則正確的證據,
+ * 反向驗證才是。**
  */
 @AnalyzeClasses(packages = "com.alantsai.ticketrush", importOptions = ImportOption.DoNotIncludeTests.class)
 class HexagonalLayeringTest {
 
+    private static final String SPRING_TRANSACTIONAL = "org.springframework.transaction.annotation.Transactional";
     private static final String SPRING_CROSS_ORIGIN = "org.springframework.web.bind.annotation.CrossOrigin";
+    private static final String JPA_ENTITY = "jakarta.persistence.Entity";
+
+    private static final String PERSISTENCE_PACKAGE = "..adapter.out.persistence..";
+    private static final String WEB_PACKAGE = "..adapter.in.web..";
 
     /**
      * R1:分層依賴方向只能由外向內。
@@ -68,6 +71,25 @@ class HexagonalLayeringTest {
             .resideInAnyPackage("org.springframework..", "jakarta.persistence..", "com.fasterxml.jackson..")
             .because("domain 對使用何種鎖、何種持久化機制必須一無所知");
 
+    /** R3:交易邊界只屬於 application 層,不得出現在 adapter(類別層級)。 */
+    @ArchTest
+    static final ArchRule noTransactionalOnAdapterClasses = noClasses()
+            .that()
+            .resideInAnyPackage(WEB_PACKAGE, PERSISTENCE_PACKAGE)
+            .should()
+            .beAnnotatedWith(SPRING_TRANSACTIONAL)
+            .because("標在 controller 會把 HTTP 處理納入交易範圍,標在 repository 則無法跨多個 repository 保證原子性");
+
+    /** R3:交易邊界只屬於 application 層,不得出現在 adapter(方法層級)。 */
+    @ArchTest
+    static final ArchRule noTransactionalOnAdapterMethods = noMethods()
+            .that()
+            .areDeclaredInClassesThat()
+            .resideInAnyPackage(WEB_PACKAGE, PERSISTENCE_PACKAGE)
+            .should()
+            .beAnnotatedWith(SPRING_TRANSACTIONAL)
+            .because("交易邊界是架構決策而非實作細節,只能由 application service 持有 ——" + "四層策略的差異有一半來自交易邊界的位置,固定在 adapter 會讓策略無法各自決定");
+
     /** R4:CORS 集中設定,不得使用 {@code @CrossOrigin}(類別層級)。 */
     @ArchTest
     static final ArchRule noCrossOriginOnClasses = noClasses()
@@ -79,4 +101,22 @@ class HexagonalLayeringTest {
     @ArchTest
     static final ArchRule noCrossOriginOnMethods =
             noMethods().should().beAnnotatedWith(SPRING_CROSS_ORIGIN).because("方法層級的 @CrossOrigin 一樣會讓 CORS 設定分散");
+
+    /**
+     * R5:JPA entity 不得外洩持久化層。
+     *
+     * <p><b>以 {@code @Entity} 註解判定,不以類別名稱結尾判定。</b> 命名慣例可被繞過 ——
+     * 把 entity 取名 {@code OrderRecord} 就避開了「以 JpaEntity 結尾」的檢查,而註解避不開。
+     *
+     * <p>entity 一旦外洩,持久化的細節就跟著擴散:延遲載入、關聯導覽、entity 生命週期,
+     * 會滲進不該知道它們的層,屆時「domain 零改動」不再成立。
+     */
+    @ArchTest
+    static final ArchRule jpaEntitiesDoNotLeakOutOfPersistence = noClasses()
+            .that()
+            .resideOutsideOfPackage(PERSISTENCE_PACKAGE)
+            .should()
+            .dependOnClassesThat()
+            .areAnnotatedWith(JPA_ENTITY)
+            .because("entity 是持久化的實作細節,外洩會讓 JPA 的行為擴散到 application 與 domain");
 }
