@@ -1,7 +1,9 @@
-# ticket-rush backend 架構設計
+# backend 架構
 
-**日期:** 2026-09-06
-**範圍:** 僅 backend repo(Spring Boot 應用內部架構)。整體專案 spec 見 Group repo。
+> 六角分層與 nexus 對照、package 根與專案目錄、套件結構、四層策略為何置於 in port、策略切換機制、domain 與 JPA entity 分離、命名慣例、五條不可違反的架構約束。
+
+> 本檔為 `openspec/project.md` 的一部分,導覽見該檔。
+> 執行環境見 `backend-runtime.md`;整體專案 spec 見 Group repo。
 
 ---
 

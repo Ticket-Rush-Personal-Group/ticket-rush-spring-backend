@@ -1,7 +1,9 @@
-# ticket-rush backend 執行環境設計
+# backend 執行環境
 
-**日期:** 2026-09-06
-**範圍:** 僅 backend repo。程式碼架構見架構設計文件,整體專案 spec 見 Group repo。
+> 開發 / 測試 / 壓測三種環境的分工、共用資料庫的使用時機、壓測環境配置與 JVM 容器資源感知、Dockerfile、壓測數據可信度聲明。
+
+> 本檔為 `openspec/project.md` 的一部分,導覽見該檔。
+> 程式碼架構見 `backend-architecture.md`;整體專案 spec 見 Group repo。
 
 ---
 
