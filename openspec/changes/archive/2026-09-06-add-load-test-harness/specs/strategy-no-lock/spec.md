@@ -1,8 +1,5 @@
-# strategy-no-lock Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change add-purchase-api-no-lock. Update Purpose after archive.
-## Requirements
 ### Requirement: 無鎖對照組
 
 第 0 層策略 SHALL 以「讀取庫存 → 於領域層計算 → 寫回絕對值」實作,不使用任何鎖機制。
@@ -67,4 +64,3 @@ TBD - created by archiving change add-purchase-api-no-lock. Update Purpose after
 - **WHEN** 後續策略以本層作為改善幅度的分母
 - **THEN** 兩者的測量條件 SHALL 相同(相同的資源限制、執行緒模型、初始庫存、請求模式)
 - **AND** 條件不同時 SHALL NOT 直接相除計算改善倍數
-

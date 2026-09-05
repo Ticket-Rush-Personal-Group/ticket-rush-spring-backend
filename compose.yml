@@ -1,0 +1,94 @@
+# =============================================================================
+# 壓測環境（perf profile）
+# -----------------------------------------------------------------------------
+#   docker compose --profile perf up -d app postgres-perf   起被測系統
+#   docker compose --profile perf run --rm k6               跑一次壓測
+#
+# 切換執行緒模型（需重啟 app —— spring.threads.virtual.enabled 是啟動時設定）：
+#   VIRTUAL_THREADS=true docker compose --profile perf up -d --force-recreate app
+#
+# 切換策略不需重啟：StrategyRegistry 以 volatile 持有，Phase 2 的管理介面會開放修改。
+#
+# **所有服務刻意不發布 host 埠。** k6 與 app 同在一個 network，以服務名稱連線，
+# 因此不需要挑選避開 ~/dev-databases（5432/6379）與 nexus（5442/6389）的埠號——
+# 埠衝突的可能性直接歸零，而不是靠選一個「應該沒人用」的號碼。
+#
+# 資源分配（本機 10 核 / 24GB）：app 4 核、postgres 2 核、k6 2 核，
+# **合計 8 核，刻意保留 2 核給 OS 與 Docker**。全部分配出去會讓 host 的排程壓力
+# 回過頭影響容器，數字反而更不穩定。
+# =============================================================================
+name: ticket-rush
+
+services:
+  app:
+    profiles: [perf]
+    build:
+      context: .
+    # 這一行是整組設定裡最關鍵的：虛擬執行緒的 carrier thread 數量預設等於
+    # Runtime.availableProcessors()，而 JVM 在容器內讀 cgroup 限制。固定成 4，
+    # 八組數據的並行度基準才一致——這是「壓測必須在容器內執行」的唯一理由。
+    cpus: 4
+    mem_limit: 2g
+    environment:
+      # 不設的話 MaxRAMPercentage 預設 25%：2GB 的容器只有 512MB heap，
+      # GC 頻繁到數據失真，而且不會有任何錯誤訊息。實測見 change 的 tasks。
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-perf:5432/ticket_rush_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: perf
+      # 啟動時設定，無法於執行期切換——這是「啟動兩次跑八組」的原因
+      SPRING_THREADS_VIRTUAL_ENABLED: "${VIRTUAL_THREADS:-false}"
+      TICKET_RUSH_STRATEGY: "${STRATEGY:-noLock}"
+    healthcheck:
+      # 打真正的端點，不檢查行程或埠：容器 running 與「可接受請求」之間有實質空窗
+      # （JVM 啟動 → Flyway migration → context 初始化完成）。
+      # curl 確認存在於 eclipse-temurin:21-jre（Ubuntu 26.04）——
+      # 寫了不存在的工具會讓容器永遠 unhealthy，而症狀看起來像「服務起不來」。
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      postgres-perf:
+        condition: service_healthy
+
+  postgres-perf:
+    profiles: [perf]
+    image: postgres:17
+    cpus: 2
+    mem_limit: 1g
+    # max_connections 預設 100，悲觀鎖策略會先撞上連線耗盡——
+    # 那個現象在圖表上與鎖等待極為相似，會導致對第 1 層的錯誤結論。
+    #
+    # **fsync 不得關閉。** 關閉可減少磁碟噪音，但影響對各策略不均等：
+    # 悲觀鎖的持鎖時間包含 commit 的 fsync，關閉等同單方面偏袒它。
+    command: postgres -c max_connections=500
+    environment:
+      POSTGRES_PASSWORD: perf
+      POSTGRES_DB: ticket_rush_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # 壓測資料每次從乾淨狀態開始，放記憶體即可
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      # 必須帶 -U/-d：官方映像初始化時會先起一次臨時伺服器，
+      # 該階段行程存在但對外連線尚未開放，只檢查行程會得到「已就緒」的錯誤結論。
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_rush_db"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  k6:
+    profiles: [perf]
+    image: grafana/k6:latest
+    cpus: 2
+    mem_limit: 512m
+    volumes:
+      - ./k6:/scripts
+    environment:
+      BASE_URL: http://app:8080
+    command: run /scripts/purchase-rush.js
+    depends_on:
+      app:
+        condition: service_healthy
