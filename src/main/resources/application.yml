@@ -2,6 +2,23 @@ spring:
   application:
     name: ticket-rush
 
+  # 開發環境連共用的 ~/dev-databases(postgres:17 on 5432)。
+  # 整合測試不走這裡 —— Testcontainers 的 @ServiceConnection 會覆蓋這組設定。
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ticket_rush_db
+    username: postgres
+    # 密碼不寫死。值來自 ~/dev-databases/.env 的 POSTGRES_PASSWORD,見 .env.example
+    password: ${DEV_DB_PASSWORD:}
+
+  jpa:
+    hibernate:
+      # schema 由 Flyway 管理,Hibernate 不得插手。
+      # validate:entity 與實際表結構不一致時,在啟動階段就失敗,而不是等到查詢才炸。
+      ddl-auto: validate
+    # 預設為 true 且會發出警告:它讓 Hibernate session 存活到 view 渲染完成,
+    # 使延遲載入在不預期的地方觸發查詢。本專案的 domain 與 entity 分離,不需要這個行為。
+    open-in-view: false
+
 management:
   endpoints:
     web:
