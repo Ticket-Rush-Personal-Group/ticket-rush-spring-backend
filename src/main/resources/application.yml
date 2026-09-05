@@ -19,6 +19,11 @@ spring:
     # 使延遲載入在不預期的地方觸發查詢。本專案的 domain 與 entity 分離,不需要這個行為。
     open-in-view: false
 
+# 當前生效的併發策略。Phase 1 僅由此設定初始化;
+# Phase 2 的管理介面才開放執行期切換(StrategyRegistry 以 volatile 持有)。
+ticket-rush:
+  strategy: noLock
+
 management:
   endpoints:
     web:
