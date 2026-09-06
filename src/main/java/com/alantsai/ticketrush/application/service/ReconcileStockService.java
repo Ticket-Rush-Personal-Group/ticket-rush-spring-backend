@@ -78,6 +78,17 @@ public class ReconcileStockService implements ReconcileStockUseCase {
             return new ReconciliationResult(eventId, 0, 0, 0, new StreamBacklog(0, false), false);
         }
 
+        // 順便檢查過期時間。**沿用既有的掃描，不另外掃一遍。**
+        //
+        // 缺少過期時間的後果是無界的記憶體成長，而它完全沒有徵兆：
+        // 不會有測試變紅、不會有錯誤訊息、壓測也看不出來。
+        //
+        // **刻意只警告、不拒絕預扣**——那會把「慢慢洩漏」變成「完全不能賣票」，
+        // 用一個更嚴重的故障去防一個較輕的問題。警告的責任是讓人知道，不是替人做決定。
+        if (!stockCachePort.hasExpiry(eventId)) {
+            log.warn("場次 {} 的快取庫存沒有設定過期時間 —— 該場次的 purchased key 將無限累積,載入時請帶上保存期限", eventId.value());
+        }
+
         int preDeducted = allocated - cached.getAsInt();
         int sold = loadEventSoldQuantityPort.loadSoldQuantity(eventId);
         int discrepancy = preDeducted - sold;
