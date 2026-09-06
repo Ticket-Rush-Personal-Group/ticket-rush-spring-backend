@@ -1,6 +1,7 @@
 package com.alantsai.ticketrush.adapter.in.web;
 
 import com.alantsai.ticketrush.adapter.in.web.dto.ApiErrorResponse;
+import com.alantsai.ticketrush.application.exception.RetryExhaustedException;
 import com.alantsai.ticketrush.domain.exception.EventNotFoundException;
 import com.alantsai.ticketrush.domain.exception.InsufficientStockException;
 import com.alantsai.ticketrush.domain.exception.PurchaseLimitExceededException;
@@ -44,6 +45,22 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiErrorResponse> handleInsufficientStock(InsufficientStockException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(ApiErrorResponse.of(ErrorCode.INSUFFICIENT_STOCK, e.getMessage()));
+    }
+
+    /**
+     * 樂觀鎖重試耗盡。
+     *
+     * <p><b>訊息是固定字串,不使用 {@code e.getMessage()}。</b> 例外訊息含嘗試次數與場次 ——
+     * 那是給日誌看的,對客戶端沒有意義,而且會洩漏系統當下的競爭狀態。
+     *
+     * <p>以 warn 而非 error 記錄:重試耗盡是本層**預期會發生**的失敗模式,不是系統故障。
+     * 記成 error 會讓壓測期間的日誌被它淹沒,真正的錯誤反而看不見。
+     */
+    @ExceptionHandler(RetryExhaustedException.class)
+    ResponseEntity<ApiErrorResponse> handleRetryExhausted(RetryExhaustedException e) {
+        log.warn("樂觀鎖重試耗盡:場次 {},嘗試 {} 次", e.eventId().value(), e.attempts());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiErrorResponse.of(ErrorCode.RETRY_EXHAUSTED, "系統忙碌,請稍後重試"));
     }
 
     /**

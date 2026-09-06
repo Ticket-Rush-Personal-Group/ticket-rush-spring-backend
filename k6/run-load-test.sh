@@ -47,4 +47,21 @@ printf '訂單筆數      : %s\n累計售出張數  : %s\n初始庫存      : %s
 
 echo
 echo "===== 測量條件（取自應用的啟動記錄，非設定檔）====="
-docker compose --profile perf logs app 2>/dev/null | grep -A5 "執行環境" | tail -6 | sed 's/^app-1  | //'
+CONDITIONS=$(docker compose --profile perf logs app 2>/dev/null | grep -A6 "執行環境" | tail -7 | sed 's/^app-1  *| //')
+echo "$CONDITIONS"
+
+# 樂觀鎖專屬：重試次數分佈。
+#
+# 分佈刻意只在 ContextClosedEvent 輸出，壓測期間完全不印——1000 併發下的 log I/O
+# 會影響被量測的數字本身，而觀測手段不該改變被觀測的對象。代價是必須讓應用正常關閉
+# 才拿得到，因此這裡主動 stop。每組壓測本來就要重啟應用切換策略，不增加額外步驟。
+if echo "$CONDITIONS" | grep -q "當前策略.*optimistic"; then
+    echo
+    echo "===== 重試次數分佈（樂觀鎖）====="
+    docker compose --profile perf stop app >/dev/null 2>&1
+    docker compose --profile perf logs app 2>/dev/null \
+        | sed 's/^app-1  *| //' \
+        | sed -n '/重試次數分佈/,/^=====*$/p'
+    echo
+    echo "（已 stop app 以取得分佈；下一組壓測請重新 up）"
+fi

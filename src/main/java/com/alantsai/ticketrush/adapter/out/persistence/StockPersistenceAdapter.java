@@ -2,6 +2,7 @@ package com.alantsai.ticketrush.adapter.out.persistence;
 
 import com.alantsai.ticketrush.adapter.out.persistence.mapper.JpaEntityMapper;
 import com.alantsai.ticketrush.adapter.out.persistence.repository.StockJpaRepository;
+import com.alantsai.ticketrush.application.port.out.CompareAndDeductStockPort;
 import com.alantsai.ticketrush.application.port.out.LoadStockForUpdatePort;
 import com.alantsai.ticketrush.application.port.out.LoadStockPort;
 import com.alantsai.ticketrush.application.port.out.UpdateStockPort;
@@ -18,7 +19,8 @@ import org.springframework.stereotype.Component;
  * 呼叫端的業務流程,等同沒鎖。
  */
 @Component
-public class StockPersistenceAdapter implements LoadStockPort, LoadStockForUpdatePort, UpdateStockPort {
+public class StockPersistenceAdapter
+        implements LoadStockPort, LoadStockForUpdatePort, UpdateStockPort, CompareAndDeductStockPort {
 
     private final StockJpaRepository repository;
 
@@ -47,5 +49,18 @@ public class StockPersistenceAdapter implements LoadStockPort, LoadStockForUpdat
     @Override
     public void updateStock(Stock stock) {
         repository.save(JpaEntityMapper.toEntity(stock));
+    }
+
+    /**
+     * 以版本比對寫回庫存。第 2 層樂觀鎖策略使用。
+     *
+     * <p>傳入的 {@link Stock} 帶著**新的可用量**與**讀取當時的版本** ——
+     * {@code Stock.deduct} 不變動版本正是為了讓後者能完整傳到這裡。
+     *
+     * @return {@code 1} 代表 CAS 成功,{@code 0} 代表版本已被他人推進
+     */
+    @Override
+    public int compareAndDeduct(Stock deducted) {
+        return repository.compareAndDeduct(deducted.eventId().value(), deducted.available(), deducted.version());
     }
 }

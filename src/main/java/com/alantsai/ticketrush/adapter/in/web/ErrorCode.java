@@ -16,5 +16,13 @@ public enum ErrorCode {
     PURCHASE_LIMIT_EXCEEDED,
     INSUFFICIENT_STOCK,
     DUPLICATE_REQUEST,
+    /**
+     * 樂觀鎖重試耗盡:**有票,但在版本競爭中連續搶輸到達上限。**
+     *
+     * <p><b>刻意不併入 {@link #INSUFFICIENT_STOCK}。</b> 兩者的意義相反 ——
+     * 庫存不足是「沒票了」,重試耗盡是「還有票,只是你沒搶到」。客戶端對後者的合理反應是**重送**,
+     * 對前者則是放棄或換場次。合併會讓客戶端做出錯誤的決定,而那正是錯誤碼要防止的事。
+     */
+    RETRY_EXHAUSTED,
     INTERNAL_ERROR
 }

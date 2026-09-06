@@ -1,6 +1,7 @@
 package com.alantsai.ticketrush.infrastructure;
 
 import com.alantsai.ticketrush.application.facade.StrategyRegistry;
+import com.alantsai.ticketrush.application.metrics.RetryStatistics;
 import com.zaxxer.hikari.HikariDataSource;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
@@ -30,11 +31,17 @@ public class RuntimeInfoLogger implements ApplicationRunner {
     private final Environment environment;
     private final StrategyRegistry strategyRegistry;
     private final DataSource dataSource;
+    private final RetryStatistics retryStatistics;
 
-    public RuntimeInfoLogger(Environment environment, StrategyRegistry strategyRegistry, DataSource dataSource) {
+    public RuntimeInfoLogger(
+            Environment environment,
+            StrategyRegistry strategyRegistry,
+            DataSource dataSource,
+            RetryStatistics retryStatistics) {
         this.environment = environment;
         this.strategyRegistry = strategyRegistry;
         this.dataSource = dataSource;
+        this.retryStatistics = retryStatistics;
     }
 
     @Override
@@ -50,6 +57,7 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 availableProcessors : {}
                 maxMemory (heap)    : {} MB
                 連線池上限          : {}
+                重試上限(樂觀鎖)    : {}
                 虛擬執行緒          : {}
                 當前策略            : {}
                 ==========================================
@@ -57,6 +65,10 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 runtime.availableProcessors(),
                 runtime.maxMemory() / BYTES_PER_MB,
                 maxPoolSize(),
+                // 從持有它的 bean 讀取，不讀設定值——與 CPU / heap / 連線池同樣的理由：
+                // 要報告的是實際生效的值。它只對樂觀鎖有意義，但仍一律輸出，
+                // 因為測量條件的表格不該有「這一組沒有這個欄位」的空洞。
+                retryStatistics.maxAttempts(),
                 virtualThreads ? "啟用" : "停用(平台執行緒)",
                 strategyRegistry.current());
     }

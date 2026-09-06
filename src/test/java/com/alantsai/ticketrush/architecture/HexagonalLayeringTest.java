@@ -1,14 +1,20 @@
 package com.alantsai.ticketrush.architecture;
 
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noFields;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noMethods;
 import static com.tngtech.archunit.library.Architectures.layeredArchitecture;
 
+import com.tngtech.archunit.core.domain.JavaClass;
+import com.tngtech.archunit.core.domain.JavaMethodCall;
 import com.tngtech.archunit.core.importer.ImportOption;
 import com.tngtech.archunit.junit.AnalyzeClasses;
 import com.tngtech.archunit.junit.ArchTest;
+import com.tngtech.archunit.lang.ArchCondition;
 import com.tngtech.archunit.lang.ArchRule;
+import com.tngtech.archunit.lang.ConditionEvents;
+import com.tngtech.archunit.lang.SimpleConditionEvent;
 
 /**
  * 六角分層的架構守則。
@@ -29,6 +35,8 @@ class HexagonalLayeringTest {
     private static final String JPA_ENTITY = "jakarta.persistence.Entity";
     private static final String PURCHASE_TICKET_USE_CASE =
             "com.alantsai.ticketrush.application.port.in.PurchaseTicketUseCase";
+    private static final String OPTIMISTIC_PURCHASE_SERVICE =
+            "com.alantsai.ticketrush.application.service.OptimisticPurchaseService";
 
     private static final String PERSISTENCE_PACKAGE = "..adapter.out.persistence..";
     private static final String WEB_PACKAGE = "..adapter.in.web..";
@@ -142,4 +150,80 @@ class HexagonalLayeringTest {
             .should()
             .haveRawType(PURCHASE_TICKET_USE_CASE)
             .because("直接持有單一策略會讓該類別綁定特定實作,「同一個 API、四種實作」的前提就不成立了");
+
+    /**
+     * R7:{@code @Transactional} 方法不得被同一類別內的方法呼叫。
+     *
+     * <p><b>self-invocation 繞過 AOP proxy,交易完全不生效,而且沒有任何錯誤訊息。</b>
+     * proxy 是包在 bean 外面的 —— {@code this.method()} 走的是原始物件,根本不經過它。
+     * 這是 Spring 最常見的錯誤,{@code CLAUDE.md} 原本把它列為「自律」並註明無測試能抓到。
+     * <b>本條就是那個測試。</b>
+     *
+     * <p>對第 2 層(樂觀鎖)尤其致命:每次重試都必須是獨立且已提交的交易,才讀得到對手的寫入。
+     * 若重試迴圈與單次嘗試寫在同一個類別,交易不生效 —— 而症狀是「重試看起來在跑、
+     * 數據看起來合理」,只有在併發下才會顯現。因此重試迴圈與單次嘗試必須是兩個 bean。
+     */
+    @ArchTest
+    static final ArchRule transactionalMethodsAreNeverSelfInvoked = classes()
+            .should(notSelfInvokeTransactionalMethods())
+            .because("self-invocation 讓 @Transactional 靜默失效 —— 交易沒有生效,但沒有任何錯誤訊息");
+
+    /**
+     * R8:持有重試迴圈的 service 不得標註 {@code @Transactional}(類別層級)。
+     *
+     * <p>R7 擋的是「兩個方法在同一個類別」,本條擋的是另一種寫法:兩個 bean 分開了,
+     * 但有人在外層也加上 {@code @Transactional}。那會讓整個重試迴圈跑在一個交易裡 ——
+     * 正確性勉強成立(READ COMMITTED 下每個語句取新快照),但**連線會被佔用整個重試期間**。
+     * 1000 併發、連線池 50,重試風暴直接把連線池吃乾,量到的又是「等連線」而不是「重試」。
+     *
+     * <p>第 6 支已經證明等連線與等鎖在延遲圖表上分不出來。本層不能重蹈。
+     */
+    @ArchTest
+    static final ArchRule retryLoopHolderIsNotTransactional = noClasses()
+            .that()
+            .haveFullyQualifiedName(OPTIMISTIC_PURCHASE_SERVICE)
+            .should()
+            .beAnnotatedWith(SPRING_TRANSACTIONAL)
+            .because("重試迴圈包在交易裡會讓連線被佔用整個重試期間,連線池成為新瓶頸,量到的不再是重試的成本");
+
+    /** R8:持有重試迴圈的 service 不得標註 {@code @Transactional}(方法層級)。 */
+    @ArchTest
+    static final ArchRule retryLoopHolderMethodsAreNotTransactional = noMethods()
+            .that()
+            .areDeclaredInClassesThat()
+            .haveFullyQualifiedName(OPTIMISTIC_PURCHASE_SERVICE)
+            .should()
+            .beAnnotatedWith(SPRING_TRANSACTIONAL)
+            .because("標在方法上與標在類別上的後果相同 —— 重試迴圈會落在單一交易內");
+
+    /**
+     * 偵測「同一類別內呼叫自己的 {@code @Transactional} 方法」。
+     *
+     * <p>以呼叫關係判定而非以命名或註解位置判定 —— 命名慣例可以繞過,呼叫關係繞不過。
+     */
+    private static ArchCondition<JavaClass> notSelfInvokeTransactionalMethods() {
+        return new ArchCondition<>("不得在同一類別內呼叫自己的 @Transactional 方法") {
+            @Override
+            public void check(JavaClass clazz, ConditionEvents events) {
+                for (JavaMethodCall call : clazz.getMethodCallsFromSelf()) {
+                    if (!call.getTargetOwner().equals(clazz)) {
+                        continue;
+                    }
+                    boolean targetIsTransactional = call.getTarget()
+                            .resolveMember()
+                            .map(method -> method.isAnnotatedWith(SPRING_TRANSACTIONAL))
+                            .orElse(false);
+                    if (targetIsTransactional) {
+                        events.add(SimpleConditionEvent.violated(
+                                clazz,
+                                "%s.%s 呼叫了同類別的 @Transactional 方法 %s —— self-invocation 繞過 proxy,交易不會生效"
+                                        .formatted(
+                                                clazz.getSimpleName(),
+                                                call.getOrigin().getName(),
+                                                call.getTarget().getName())));
+                    }
+                }
+            }
+        };
+    }
 }
