@@ -6,6 +6,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.env.Environment;
@@ -32,16 +33,19 @@ public class RuntimeInfoLogger implements ApplicationRunner {
     private final StrategyRegistry strategyRegistry;
     private final DataSource dataSource;
     private final RetryStatistics retryStatistics;
+    private final long reconciliationIntervalMs;
 
     public RuntimeInfoLogger(
             Environment environment,
             StrategyRegistry strategyRegistry,
             DataSource dataSource,
-            RetryStatistics retryStatistics) {
+            RetryStatistics retryStatistics,
+            @Value("${ticket-rush.redis.reconciliation-interval-ms}") long reconciliationIntervalMs) {
         this.environment = environment;
         this.strategyRegistry = strategyRegistry;
         this.dataSource = dataSource;
         this.retryStatistics = retryStatistics;
+        this.reconciliationIntervalMs = reconciliationIntervalMs;
     }
 
     @Override
@@ -58,6 +62,8 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 maxMemory (heap)    : {} MB
                 連線池上限          : {}
                 重試上限(樂觀鎖)    : {}
+                對帳間隔(Redis 預扣): {} ms
+                Redis               : {}
                 虛擬執行緒          : {}
                 當前策略            : {}
                 ==========================================
@@ -69,6 +75,11 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 // 要報告的是實際生效的值。它只對樂觀鎖有意義，但仍一律輸出，
                 // 因為測量條件的表格不該有「這一組沒有這個欄位」的空洞。
                 retryStatistics.maxAttempts(),
+                reconciliationIntervalMs,
+                // Redis 也是測量條件的一部分：**第 0/1/2 層完全不碰它**，
+                // 四層並列時必須看得出哪一層多用了一個元件。
+                environment.getProperty("spring.data.redis.host", "未知") + ":"
+                        + environment.getProperty("spring.data.redis.port", "未知"),
                 virtualThreads ? "啟用" : "停用(平台執行緒)",
                 strategyRegistry.current());
     }

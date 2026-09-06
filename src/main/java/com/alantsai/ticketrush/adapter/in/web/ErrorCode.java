@@ -24,5 +24,13 @@ public enum ErrorCode {
      * 對前者則是放棄或換場次。合併會讓客戶端做出錯誤的決定,而那正是錯誤碼要防止的事。
      */
     RETRY_EXHAUSTED,
+    /**
+     * 場次存在,但尚未載入快取庫存 —— **尚未開賣**。
+     *
+     * <p><b>刻意不併入 {@link #EVENT_NOT_FOUND} 或 {@link #INSUFFICIENT_STOCK}。</b>
+     * 說成「找不到」會讓使用者以為連結壞了;說成「賣完了」會讓他放棄一場根本還沒開始賣的活動。
+     * 兩種誤導都會讓使用者做出錯誤的決定,而那正是錯誤碼要防止的事。
+     */
+    EVENT_NOT_ON_SALE,
     INTERNAL_ERROR
 }

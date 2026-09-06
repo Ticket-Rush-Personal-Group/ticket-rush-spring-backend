@@ -20,6 +20,16 @@ spring:
       # **此值必須納入壓測的測量條件**：它會影響所有策略的數據。
       maximum-pool-size: 50
 
+  # 第 3 層（Redis 預扣）使用。開發環境連共用的 ~/dev-databases（redis:7 on 6379），
+  # 與 postgres 同樣的處置：整合測試不走這裡——Testcontainers 的 @ServiceConnection 會覆蓋它。
+  #
+  # 刻意不設密碼：~/dev-databases 的 redis 未啟用認證。壓測環境用自己的容器，
+  # 同樣在隔離網路內且不對外開埠。
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
   jpa:
     hibernate:
       # schema 由 Flyway 管理,Hibernate 不得插手。
@@ -48,6 +58,24 @@ ticket-rush:
     #
     # 不寫死：壓測要在不改程式碼的情況下對照上限 100 與 10。
     max-attempts: 100
+
+  redis:
+    # 待落庫訂單的 Stream 與 consumer group（第 3 層）。
+    #
+    # 選 Stream 而非 List：Stream 有 consumer group、ack 與 pending 清單，
+    # 消費者崩潰時訊息仍留在 pending 可被重新領取。若載體本身會無聲掉單，
+    # 「對帳收斂」這個驗收就永遠不會成立，而那個不收斂是載體造成的、不是設計造成的——
+    # 兩者混在一起就查不出來了。
+    stream: orders
+    consumer-group: order-persistence
+    # 單一實例，名稱固定即可。多實例部署時每個實例必須有不同的名稱，
+    # 否則兩個實例會共用同一份 pending 清單，互相「認領」對方尚未處理完的訊息。
+    consumer-name: consumer-1
+    # 週期對帳的間隔。**此值必須納入壓測的測量條件**——
+    # 太長，收斂在壓測結束前看不到；太短，對帳本身成為負載。兩者都會改變本層的數字。
+    #
+    # 暫定 1 秒，取得第一組數據後再定案（見 design.md 的 Open Questions）。
+    reconciliation-interval-ms: 1000
 
 management:
   endpoints:

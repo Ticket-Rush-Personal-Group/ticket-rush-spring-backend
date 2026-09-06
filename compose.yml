@@ -36,6 +36,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-perf:5432/ticket_rush_db
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: perf
+      SPRING_DATA_REDIS_HOST: redis-perf
+      SPRING_DATA_REDIS_PORT: "6379"
       # 啟動時設定，無法於執行期切換——這是「啟動兩次跑八組」的原因
       SPRING_THREADS_VIRTUAL_ENABLED: "${VIRTUAL_THREADS:-false}"
       TICKET_RUSH_STRATEGY: "${STRATEGY:-noLock}"
@@ -58,6 +60,8 @@ services:
       start_period: 30s
     depends_on:
       postgres-perf:
+        condition: service_healthy
+      redis-perf:
         condition: service_healthy
 
   postgres-perf:
@@ -82,6 +86,23 @@ services:
       # 必須帶 -U/-d：官方映像初始化時會先起一次臨時伺服器，
       # 該階段行程存在但對外連線尚未開放，只檢查行程會得到「已就緒」的錯誤結論。
       test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_rush_db"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-perf:
+    profiles: [perf]
+    image: redis:7
+    # 資源限制與 postgres 對齊，理由相同：四層要在同一組資源條件下比較。
+    # **第 0 / 1 / 2 層完全不碰這個服務**——它的存在本身就是第 3 層的代價之一，
+    # 因此必須出現在測量條件裡，不能當作背景設施。
+    cpus: 2
+    mem_limit: 1g
+    # 不做持久化：壓測資料每次從乾淨狀態開始，而 RDB/AOF 的落盤時機
+    # 會在測量期間插入不可預期的暫停，那與被量測的併發行為無關。
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30
