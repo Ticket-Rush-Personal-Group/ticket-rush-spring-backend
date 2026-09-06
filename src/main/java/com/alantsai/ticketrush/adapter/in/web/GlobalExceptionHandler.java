@@ -1,6 +1,8 @@
 package com.alantsai.ticketrush.adapter.in.web;
 
 import com.alantsai.ticketrush.adapter.in.web.dto.ApiErrorResponse;
+import com.alantsai.ticketrush.application.exception.DuplicateOrderException;
+import com.alantsai.ticketrush.application.exception.EventNotOnSaleException;
 import com.alantsai.ticketrush.application.exception.RetryExhaustedException;
 import com.alantsai.ticketrush.domain.exception.EventNotFoundException;
 import com.alantsai.ticketrush.domain.exception.InsufficientStockException;
@@ -25,9 +27,6 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
-
-    /** 冪等鍵唯一約束的名稱。用它區分「重複請求」與其他資料完整性錯誤。 */
-    private static final String IDEMPOTENCY_CONSTRAINT = "uq_purchase_order_idempotency_key";
 
     @ExceptionHandler(EventNotFoundException.class)
     ResponseEntity<ApiErrorResponse> handleEventNotFound(EventNotFoundException e) {
@@ -64,18 +63,39 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * 資料完整性違反。
+     * 場次尚未開賣(第 3 層:快取中沒有該場次的庫存)。
      *
-     * <p>以約束名稱區分冪等鍵重複與其他情況 —— 不加區分一律回 409 DUPLICATE_REQUEST 會誤導:
-     * 外鍵違反、CHECK 違反都會走到這裡,而它們不是「重複請求」。
+     * <p>回 409 而非 404:場次**存在**,只是還沒開賣。404 會讓使用者以為連結有誤。
+     */
+    @ExceptionHandler(EventNotOnSaleException.class)
+    ResponseEntity<ApiErrorResponse> handleEventNotOnSale(EventNotOnSaleException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiErrorResponse.of(ErrorCode.EVENT_NOT_ON_SALE, "場次尚未開賣,請稍後再試"));
+    }
+
+    /**
+     * 冪等鍵重複。
+     *
+     * <p><b>接的是 {@link DuplicateOrderException} 而非 {@code DataIntegrityViolationException}。</b>
+     * 約束違反在**持久化 adapter** 就被翻譯成應用層的例外了 —— 那是 adapter 的職責,
+     * 而且讓翻譯只發生在一個地方:落庫的消費者與本 handler 因此看到的是同一種例外,
+     * 不必各自比對約束名稱。**各自比對的風險不是打錯字(那會立刻壞),而是只改了其中一處** ——
+     * 那時一邊仍能辨識、另一邊不能。
+     */
+    @ExceptionHandler(DuplicateOrderException.class)
+    ResponseEntity<ApiErrorResponse> handleDuplicateOrder(DuplicateOrderException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiErrorResponse.of(ErrorCode.DUPLICATE_REQUEST, "相同的請求已經處理過"));
+    }
+
+    /**
+     * 其餘的資料完整性違反。
+     *
+     * <p>外鍵違反、CHECK 違反都會走到這裡,而它們不是「重複請求」——
+     * 一律回 409 DUPLICATE_REQUEST 會誤導客戶端去做無意義的重送。
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     ResponseEntity<ApiErrorResponse> handleDataIntegrity(DataIntegrityViolationException e) {
-        String detail = e.getMostSpecificCause().getMessage();
-        if (detail != null && detail.contains(IDEMPOTENCY_CONSTRAINT)) {
-            return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(ApiErrorResponse.of(ErrorCode.DUPLICATE_REQUEST, "相同的請求已經處理過"));
-        }
         log.error("未預期的資料完整性違反", e);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiErrorResponse.of(ErrorCode.INTERNAL_ERROR, "系統發生非預期的錯誤"));

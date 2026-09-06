@@ -19,4 +19,15 @@ public interface OrderJpaRepository extends JpaRepository<OrderJpaEntity, Long> 
     @Query("select coalesce(sum(o.quantity), 0) from OrderJpaEntity o "
             + "where o.eventId = :eventId and o.userId = :userId")
     int sumPurchasedQuantity(@Param("eventId") Long eventId, @Param("userId") Long userId);
+
+    /**
+     * 冪等鍵是否已存在。第 3 層的落庫消費者用它判斷「這則訊息先前已成功落庫」。
+     *
+     * <p>查詢落在 {@code uq_purchase_order_idempotency_key} 這個唯一索引上。
+     */
+    boolean existsByIdempotencyKey(String idempotencyKey);
+
+    /** 某場次已售出的張數總和。對帳以此與 Redis 的扣減量比對。 */
+    @Query("select coalesce(sum(o.quantity), 0) from OrderJpaEntity o where o.eventId = :eventId")
+    int sumSoldQuantity(@Param("eventId") Long eventId);
 }

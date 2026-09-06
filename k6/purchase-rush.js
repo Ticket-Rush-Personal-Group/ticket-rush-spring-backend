@@ -38,8 +38,11 @@ export default function () {
         },
     });
 
+    // 成功的狀態碼依策略而異：同步落庫的三層回 201 Created，
+    // Redis 預扣回 202 Accepted——回應的當下訂單確實還不存在。
+    // 只檢查 201 的話，第 3 層的成功率會顯示成 0，那是量測工具的錯，不是系統的。
     check(res, {
-        '201 created': (r) => r.status === 201,
-        '409 rejected': (r) => r.status === 409,
+        accepted: (r) => r.status === 201 || r.status === 202,
+        rejected: (r) => r.status === 409,
     });
 }

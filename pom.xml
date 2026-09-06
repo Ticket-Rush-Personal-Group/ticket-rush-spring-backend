@@ -60,6 +60,16 @@
 			<groupId>org.flywaydb</groupId>
 			<artifactId>flyway-database-postgresql</artifactId>
 		</dependency>
+		<!--
+			Redis 預扣策略（第 8 支）。刻意不引入 Redisson：
+			本層只需要 Lua 腳本與 Stream，StringRedisTemplate 已足夠。
+			Redisson 會帶進整套分散式鎖與分散式物件，而分散式鎖正是本層刻意不用的東西
+			——那會變成第 1 層（悲觀鎖）的遠端版，四層的區別就消失了。
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-redis</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
@@ -102,8 +112,24 @@
 			<scope>test</scope>
 		</dependency>
 		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-redis-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
 			<groupId>org.testcontainers</groupId>
 			<artifactId>testcontainers-postgresql</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<!--
+			Redis 的 Testcontainers 模組由第三方 com.redis 提供（Testcontainers 官方 BOM 沒有
+			redis 模組），但版本由 Spring Boot 的 BOM 管理，故不寫死版本。
+			groupId 不是 org.testcontainers——那是這次一開始寫錯的地方，
+			症狀是「dependencies.dependency.version is missing」而不是「找不到 artifact」。
+		-->
+		<dependency>
+			<groupId>com.redis</groupId>
+			<artifactId>testcontainers-redis</artifactId>
 			<scope>test</scope>
 		</dependency>
 		<dependency>

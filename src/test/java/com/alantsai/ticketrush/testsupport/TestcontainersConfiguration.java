@@ -1,8 +1,10 @@
 package com.alantsai.ticketrush.testsupport;
 
+import com.redis.testcontainers.RedisContainer;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
+import org.springframework.test.context.DynamicPropertyRegistrar;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
@@ -31,16 +33,55 @@ public class TestcontainersConfiguration {
     // Testcontainers 2.x 的 org.testcontainers.postgresql.PostgreSQLContainer 不是泛型類別
     // (1.x 在 org.testcontainers.containers 底下是自遞迴泛型 PostgreSQLContainer<SELF>)。
     // 寫 <> 會編譯失敗:「非泛型類別不能使用 '<>'」。
-    // max_connections 提高至 300：Spring 的 context 快取會保留多個 context，
-    // 每個 context 各有一個連線池（上限 50）。三個以上的 context 就會超過
-    // PostgreSQL 預設的 100，症狀是「某些測試偶發連不上資料庫」——
-    // 而它看起來像不穩定的測試，不像設定問題。
+    // max_connections 提高至 500：Spring 的 context 快取會保留多個 context，
+    // 每個 context 各有一個連線池（上限 50）。症狀是「某些測試偶發連不上資料庫」
+    // （FATAL: sorry, too many clients already）——而它看起來像不穩定的測試，不像設定問題。
+    //
+    // **第 8 支再次撞到同一堵牆**：新增三個測試 context 之後 300 也不夠了。
+    // 光是拉高上限治標不治本，真正的原因見下方的 minimum-idle 設定。
     private static final PostgreSQLContainer POSTGRES =
-            new PostgreSQLContainer("postgres:17").withCommand("postgres", "-c", "max_connections=300");
+            new PostgreSQLContainer("postgres:17").withCommand("postgres", "-c", "max_connections=500");
+
+    // Redis 容器同樣以 static 欄位持有，理由與上面完全相同。
+    //
+    // 模組來自第三方 com.redis（Testcontainers 官方 BOM 沒有 redis 模組），
+    // 但版本由 Spring Boot 的 BOM 管理。@ServiceConnection 的支援由
+    // spring-boot-data-redis 的 RedisContainerConnectionDetailsFactory 提供，
+    // 隨 spring-boot-starter-data-redis 一併進來，不需額外相依。
+    //
+    // 版本寫死 redis:7，與 ~/dev-databases 及壓測環境一致——
+    // Lua 腳本的執行語意與 Stream 的 API 都可能隨版本變動。
+    private static final RedisContainer REDIS = new RedisContainer("redis:7");
 
     @Bean
     @ServiceConnection
     PostgreSQLContainer postgresContainer() {
         return POSTGRES;
+    }
+
+    @Bean
+    @ServiceConnection
+    RedisContainer redisContainer() {
+        return REDIS;
+    }
+
+    /**
+     * 測試環境把 HikariCP 的 {@code minimum-idle} 調小。
+     *
+     * <p><b>問題的真正原因:{@code minimumIdle} 預設等於 {@code maximumPoolSize}。</b>
+     * 正式設定的上限是 50,於是**每一個 Spring test context 一啟動就預先開滿 50 條連線** ——
+     * 即使那個 context 只跑了一個不碰資料庫的測試。context 快取又會把它們全部留著,
+     * 測試類別一多就必然撞上 {@code max_connections}。
+     *
+     * <p>調小之後,連線改為按需開啟:真正需要併發的測試仍可長到 50,
+     * 其餘 context 只留 2 條。**上限維持 50 不動** —— 那是壓測的測量條件,
+     * 為了讓測試跑得過而改掉它,等於讓測試環境與被量測的環境不一致。
+     *
+     * <p>以 {@link DynamicPropertyRegistrar} 註冊而非放進 {@code src/test/resources/application.yml}:
+     * 後者會**整份遮蔽**主設定檔,而不是覆寫其中一個值 —— 那是個安靜且難查的陷阱。
+     */
+    @Bean
+    DynamicPropertyRegistrar testPoolSizing() {
+        return registry -> registry.add("spring.datasource.hikari.minimum-idle", () -> 2);
     }
 }
