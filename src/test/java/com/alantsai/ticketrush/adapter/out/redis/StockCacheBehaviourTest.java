@@ -8,6 +8,7 @@ import com.alantsai.ticketrush.domain.valueobject.EventId;
 import com.alantsai.ticketrush.domain.valueobject.Quantity;
 import com.alantsai.ticketrush.domain.valueobject.UserId;
 import com.alantsai.ticketrush.testsupport.TestcontainersConfiguration;
+import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -178,6 +179,66 @@ class StockCacheBehaviourTest {
         assertThat(succeeded.get()).as("同一人的成功次數應恰好等於限購上限").isEqualTo(LIMIT);
         assertThat(purchasedInRedis()).isEqualTo(String.valueOf(LIMIT));
         assertThat(stockInRedis()).as("庫存只應被扣掉成交的部分").isEqualTo(String.valueOf(500 - LIMIT));
+    }
+
+    @Test
+    @DisplayName("已購數的到期時間**晚於**庫存 —— 不是相同")
+    void purchasedExpiresAfterStock() {
+        givenStockWithTtl(500, Duration.ofHours(24));
+
+        stockCachePort.preDeduct(EVENT_ID, USER_ID, one(), LIMIT);
+
+        Long stockTtl = redis.getExpire(RedisKeys.stock(EVENT_ID));
+        Long purchasedTtl = redis.getExpire(RedisKeys.purchased(EVENT_ID, USER_ID));
+
+        assertThat(purchasedTtl).as("已購數必須有過期時間").isNotNull().isPositive();
+        // 相同的到期時間並不安全：Redis 的過期是惰性 + 抽樣的，
+        // 兩個同時到期的 key 完全可能一個已消失、另一個還在——
+        // 而其中一半的可能性是「已購數先消失」，那會讓限購額度歸零而超買。
+        assertThat(purchasedTtl).as("已購數必須確定活得比庫存久,而不是同時到期").isGreaterThan(stockTtl);
+    }
+
+    @Test
+    @DisplayName("庫存沒有過期時間時,已購數也不設 —— 保持一致")
+    void purchasedHasNoTtlWhenStockHasNone() {
+        givenStock(500);
+
+        stockCachePort.preDeduct(EVENT_ID, USER_ID, one(), LIMIT);
+
+        // 一致地都不過期，而不是只有其中一個過期——後者有一半機率走向不安全的方向。
+        // 這個情況本身是設定遺漏，由對帳的警告負責讓人看見。
+        assertThat(redis.getExpire(RedisKeys.stock(EVENT_ID))).isEqualTo(-1);
+        assertThat(redis.getExpire(RedisKeys.purchased(EVENT_ID, USER_ID))).isEqualTo(-1);
+    }
+
+    @Test
+    @DisplayName("回補之後庫存的過期時間仍在 —— 釘住「INCRBY 保留 TTL」這個假設")
+    void restorePreservesExpiry() {
+        givenStockWithTtl(500, Duration.ofHours(24));
+        stockCachePort.preDeduct(EVENT_ID, USER_ID, new Quantity(2), LIMIT);
+
+        stockCachePort.restore(EVENT_ID, USER_ID, new Quantity(2));
+        stockCachePort.restoreStockOnly(EVENT_ID, 1);
+
+        // 這條守的不是本專案的邏輯，是本專案對 Redis 的假設：
+        // INCRBY/DECRBY 保留 TTL，只有 SET 會清掉它。
+        // 把回補改寫成「讀出來、算好、SET 回去」是個看起來完全合理的重構，
+        // 而它會無聲地移除過期時間——所有其他測試依然全綠。
+        assertThat(redis.getExpire(RedisKeys.stock(EVENT_ID))).as("回補不得清除過期時間").isPositive();
+    }
+
+    @Test
+    @DisplayName("hasExpiry 正確反映庫存 key 有無過期時間")
+    void reportsWhetherStockHasExpiry() {
+        givenStock(500);
+        assertThat(stockCachePort.hasExpiry(EVENT_ID)).isFalse();
+
+        givenStockWithTtl(500, Duration.ofHours(24));
+        assertThat(stockCachePort.hasExpiry(EVENT_ID)).isTrue();
+    }
+
+    private void givenStockWithTtl(int available, Duration ttl) {
+        redis.opsForValue().set(RedisKeys.stock(EVENT_ID), String.valueOf(available), ttl);
     }
 
     private Quantity one() {

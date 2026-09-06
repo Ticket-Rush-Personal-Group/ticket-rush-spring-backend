@@ -15,6 +15,8 @@ cd "$(dirname "$0")/.."
 
 INITIAL_STOCK="${INITIAL_STOCK:-500}"
 VUS="${VUS:-1000}"
+# 快取的保存期限（秒）。預設一天，遠長於任何一次壓測。
+CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-86400}"
 
 # -q 不可省：INSERT ... RETURNING 會同時輸出 tuple 與 "INSERT 0 1" 這行 command status，
 # 後者會被一起吃進變數，造成下一句 SQL 語法錯誤。
@@ -42,8 +44,14 @@ if [ "$STRATEGY_IN_USE" = "redisPreDeduct" ]; then
     # 清空 stream 用 XTRIM 而不是 DEL：DEL 會連 consumer group 一起刪掉，
     # 而應用正在跑，它的消費者會拿到 NOGROUP 並中止訂閱——症狀是「訂單再也不落庫」。
     redis_cli XTRIM orders MAXLEN 0 >/dev/null 2>&1 || true
-    redis_cli SET "stock:${EVENT_ID}" "${INITIAL_STOCK}" >/dev/null
-    echo "Redis 快取庫存已載入：stock:${EVENT_ID} = ${INITIAL_STOCK}"
+    # **必須帶過期時間。** 不帶的話 stock 與 purchased 都會永遠留著，
+    # 而 purchased 是「每個買過票的人一個 key」——那是無界的記憶體成長，
+    # 且不會有任何測試變紅、不會有錯誤訊息、壓測也看不出來（環境每次重建）。
+    #
+    # 這裡代表的是「快取的保存期限」，不是「場次的結束時間」——schema 沒有後者。
+    # 銷售期若超過它，場次會在銷售中變成「未開賣」：fail-closed 的停擺，不是資料錯誤。
+    redis_cli SET "stock:${EVENT_ID}" "${INITIAL_STOCK}" EX "${CACHE_TTL_SECONDS}" >/dev/null
+    echo "Redis 快取庫存已載入：stock:${EVENT_ID} = ${INITIAL_STOCK}（保存期限 ${CACHE_TTL_SECONDS}s）"
 fi
 
 echo "場次 ${EVENT_ID}，初始庫存 ${INITIAL_STOCK}，策略 ${STRATEGY_IN_USE}"

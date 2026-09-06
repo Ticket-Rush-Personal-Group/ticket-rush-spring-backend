@@ -35,6 +35,17 @@ public class StockCacheAdapter implements StockCachePort {
     private static final int CODE_INSUFFICIENT_STOCK = -2;
     private static final int CODE_NOT_ON_SALE = -3;
 
+    /**
+     * 已購數比庫存多活多久(秒)。
+     *
+     * <p><b>常數而非設定:它是安全邊界,不是可調參數。</b> 做成設定只會讓某天有人把它調成 0 ——
+     * 而 0 代表兩者同時到期,那正是不安全的情況(Redis 的惰性過期不保證同時消失)。
+     *
+     * <p>一小時:它只需要大於 Redis 惰性過期的不確定性,而那是秒等級的。
+     * 多出來的餘裕不花任何成本 —— 過期的已購數 key 不佔用邏輯,只佔一點記憶體。
+     */
+    private static final int PURCHASED_TTL_BUFFER_SECONDS = 3600;
+
     private final StringRedisTemplate redis;
     private final RedisScript<Long> preDeductScript;
     private final RedisScript<Long> restoreScript;
@@ -54,7 +65,8 @@ public class StockCacheAdapter implements StockCachePort {
                 preDeductScript,
                 List.of(RedisKeys.stock(eventId), RedisKeys.purchased(eventId, userId)),
                 String.valueOf(quantity.value()),
-                String.valueOf(maxTicketsPerUser));
+                String.valueOf(maxTicketsPerUser),
+                String.valueOf(PURCHASED_TTL_BUFFER_SECONDS));
 
         return toResult(code);
     }
@@ -101,6 +113,18 @@ public class StockCacheAdapter implements StockCachePort {
             }
         }
         return events;
+    }
+
+    /**
+     * 庫存 key 是否設有過期時間。
+     *
+     * <p>供對帳在掃描時順便檢查。**沒有過期時間的 key 會無限累積,而且完全沒有徵兆** ——
+     * 不會有測試變紅、不會有錯誤訊息、壓測也看不出來(環境每次重建)。
+     */
+    @Override
+    public boolean hasExpiry(EventId eventId) {
+        Long seconds = redis.getExpire(RedisKeys.stock(eventId));
+        return seconds != null && seconds > 0;
     }
 
     @Override

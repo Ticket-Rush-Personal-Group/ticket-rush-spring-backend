@@ -79,6 +79,15 @@ public interface StockCachePort {
     Set<EventId> eventsOnSale();
 
     /**
+     * 該場次的庫存 key 是否設有過期時間。
+     *
+     * <p><b>用於讓「忘記設過期時間」這件事被看見,而不是替呼叫端做決定。</b>
+     * 缺少過期時間的後果是無界的記憶體成長 —— 而它不會使任何測試失敗、
+     * 不會產生錯誤訊息、也不會出現在壓測中。
+     */
+    boolean hasExpiry(EventId eventId);
+
+    /**
      * 某使用者在某場次的已購張數。
      *
      * <p><b>僅供錯誤訊息使用,不得作為判斷依據。</b> 限購的判斷已在 Lua 腳本內原子完成;
