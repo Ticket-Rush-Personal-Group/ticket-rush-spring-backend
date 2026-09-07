@@ -1,5 +1,15 @@
 import http from 'k6/http';
 import { check } from 'k6';
+import { Counter } from 'k6/metrics';
+
+// k6 預設不提供狀態碼分佈，而 http_req_failed 把 4xx 與 5xx 合併成一個數字。
+//
+// **本專案必須把兩者分開:409 是策略正確運作的證據,5xx 才是故障。**
+// 庫存不足、超過限購、重試耗盡、場次未開賣都回 409——那正是併發控制在生效。
+// 合併之後會產生一個反向的誤導:第 0 層（無鎖）的失敗率最低，
+// 因為它幾乎全部成功——而那正是它壞掉的原因。
+const clientErrors = new Counter('client_errors');
+const serverErrors = new Counter('server_errors');
 
 // 搶票的本質是瞬間爆發，不是穩態負載。
 // 刻意不用「固定 VU 持續 N 秒」的常見壓測模式——那會在庫存賣完後
@@ -55,6 +65,12 @@ export default function () {
     // 成功的狀態碼依策略而異：同步落庫的三層回 201 Created，
     // Redis 預扣回 202 Accepted——回應的當下訂單確實還不存在。
     // 只檢查 201 的話，第 3 層的成功率會顯示成 0，那是量測工具的錯，不是系統的。
+    if (res.status >= 500) {
+        serverErrors.add(1);
+    } else if (res.status >= 400) {
+        clientErrors.add(1);
+    }
+
     check(res, {
         accepted: (r) => r.status === 201 || r.status === 202,
         rejected: (r) => r.status === 409,
