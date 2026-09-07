@@ -31,6 +31,18 @@ VUS="${VUS:-1000}"
 ITERATIONS="${ITERATIONS:-50}"
 RUNS="${RUNS:-1}"
 WARMUP="${WARMUP:-true}"
+# **暖機暖到「收斂」為止，不用固定輪數。**
+#
+# 實測(第 11 支)：Redis 預扣在固定輪數下,量到的數字隨輪數單調上升 ——
+# 1 輪 → 3810、2 輪 → 5219、3 輪 → 8130 req/s。**每加一輪就更高一截,始終沒有停。**
+# 而每一次的第 1 輪都落在 1600～1800,那正是「完全沒暖」的水位。
+#
+# 固定輪數的問題是它必然低估,而低估的幅度隨層而異(有背景執行緒的層收斂更慢)——
+# 那會讓層與層之間的比較失真,而且是系統性的失真,不是雜訊。
+#
+# 因此改為:連續兩輪的差距小於門檻才算暖完,並設上限避免無限迴圈。
+WARMUP_CONVERGE_PCT="${WARMUP_CONVERGE_PCT:-5}"
+WARMUP_MAX_ROUNDS="${WARMUP_MAX_ROUNDS:-10}"
 # 快取的保存期限（秒）。預設一天，遠長於任何一次壓測。
 CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-86400}"
 
@@ -41,8 +53,23 @@ redis_cli() { docker compose --profile perf exec -T redis-perf redis-cli "$@"; }
 
 # 當前策略取自應用的啟動記錄，不是取自環境變數——
 # 第 4 支的教訓：compose 可能靜默替換容器，環境變數說的是「應該是什麼」而非「實際是什麼」。
+# 應用剛啟動時，啟動記錄可能還沒寫出來（healthcheck 通過不代表 ApplicationRunner 已執行完）。
+#
+# **找不到時必須大聲失敗，不能讓腳本靜默死掉。** 原本直接 grep，找不到就回 1，
+# 而 `set -e` 會讓 `STRATEGY_IN_USE=$(current_strategy)` 中止整個腳本——
+# 那一行在任何 echo 之前，於是**連一個字都不會輸出**，看起來像什麼事都沒發生。
 current_strategy() {
-    docker compose --profile perf logs app 2>/dev/null | grep -m1 "當前策略" | sed 's/.*: *//' | tr -d '\r'
+    local attempt found
+    for attempt in $(seq 1 30); do
+        found=$(docker compose --profile perf logs app 2>/dev/null | grep -m1 "當前策略" | sed 's/.*: *//' | tr -d '\r' || true)
+        if [ -n "$found" ]; then
+            echo "$found"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "無法從應用的啟動記錄判斷當前策略（等了 30 秒）。應用起來了嗎？" >&2
+    return 1
 }
 
 STRATEGY_IN_USE=$(current_strategy)
@@ -56,6 +83,13 @@ EVENT_ID=""
 # ---------------------------------------------------------------------------
 reset_data() {
     psql -c "TRUNCATE purchase_order, stock, event RESTART IDENTITY CASCADE;" >/dev/null
+    # **CHECKPOINT 不可省。** TRUNCATE 清得掉資料表，清不掉 WAL。
+    # 每一輪對單一庫存列做兩萬五千次 UPDATE、外加同量的 INSERT，WAL 累積很快，
+    # 而壓測環境的 postgres 資料放在 tmpfs（記憶體）——WAL 堆積會直接吃掉可用記憶體。
+    #
+    # 症狀是「同一組的三次量測逐次變慢」（實測悲觀鎖 4572 → 4246 → 3953），
+    # 看起來像雜訊，實際上是單調衰退。強制檢查點讓每一輪從同樣的狀態開始。
+    psql -c "CHECKPOINT;" >/dev/null
     EVENT_ID=$(psql -c "INSERT INTO event (name, sales_start_at, total_quantity) VALUES ('壓測場次', now(), ${INITIAL_STOCK}) RETURNING id;")
     psql -c "INSERT INTO stock (event_id, available) VALUES (${EVENT_ID}, ${INITIAL_STOCK});" >/dev/null
 
@@ -129,6 +163,15 @@ extract_metric() {
     grep -m1 'http_req_duration' "$1" | grep -oE "$2=[^ ]+" | head -1 | sed "s|$2=||"
 }
 
+# k6 摘要中某一列的第一個數值。列的形狀是 `name.....: 25000  11574.28/s`。
+#
+# **值為 0 的自訂 counter 不會出現在 k6 的摘要裡**，因此找不到時必須回 0 而不是失敗。
+# 少了 `|| true`，`set -e` 會讓整個腳本在「這一組完全沒有錯誤」時中止——
+# 一個只在系統健康時才發生的失敗。
+extract_counter() {
+    { grep -m1 "$2" "$1" | awk -F: '{print $2}' | awk '{print $1}'; } 2>/dev/null || true
+}
+
 # 中位數。**刻意不用平均**——平均會被離群值拉到一個從未出現過的值上
 # （實測：無鎖三次為 494 / 682 / 852）。
 median() {
@@ -163,12 +206,33 @@ echo
 # **參數與正式量測完全相同。** 用較小的負載暖機會讓 JIT 走上不同的分支路徑，
 # 連線池與資料庫的 buffer cache 也不會進入正式量測時的狀態。
 # ---------------------------------------------------------------------------
+WARMUP_ROUNDS_USED=0
+WARMUP_CONVERGED="否"
 if [ "$WARMUP" = "true" ]; then
-    echo "===== 暖機（結果丟棄）====="
-    reset_data
-    run_k6 "$TMPDIR_RUN/warmup.log"
-    drain_async_persistence >/dev/null
-    echo "暖機完成：$(extract_rps "$TMPDIR_RUN/warmup.log") req/s（此數字不列入統計）"
+    echo "===== 暖機至收斂（連續兩輪差距 < ${WARMUP_CONVERGE_PCT}%，上限 ${WARMUP_MAX_ROUNDS} 輪）====="
+    prev=""
+    for w in $(seq 1 "$WARMUP_MAX_ROUNDS"); do
+        reset_data
+        run_k6 "$TMPDIR_RUN/warmup_$w.log"
+        drain_async_persistence >/dev/null
+        cur=$(extract_rps "$TMPDIR_RUN/warmup_$w.log")
+        WARMUP_ROUNDS_USED=$w
+
+        if [ -n "$prev" ]; then
+            delta=$(awk -v a="$prev" -v b="$cur" 'BEGIN{ if (b>0) printf "%.1f", (b>a? b-a : a-b)/b*100; else print 999 }')
+            echo "  第 ${w} 輪：${cur} req/s（與前一輪相差 ${delta}%）"
+            if awk -v d="$delta" -v t="$WARMUP_CONVERGE_PCT" 'BEGIN{exit !(d < t)}'; then
+                WARMUP_CONVERGED="是"
+                break
+            fi
+        else
+            echo "  第 ${w} 輪：${cur} req/s"
+        fi
+        prev="$cur"
+    done
+    if [ "$WARMUP_CONVERGED" = "否" ]; then
+        echo "  >>> 警告：${WARMUP_MAX_ROUNDS} 輪內未收斂 —— **本組數據不得用於跨層比較**"
+    fi
     echo
 fi
 
@@ -194,8 +258,24 @@ printf '各次          : %s\n' "$(printf '%s / ' "${RPS_VALUES[@]}" | sed 's| /
 printf '中位數        : %s req/s\n' "$(median "${RPS_VALUES[@]}")"
 # 全距是這份輸出裡最重要的一個數字：兩組數據的差距若小於全距，就不能下結論。
 printf '>>> 全距      : %s%%   ((max-min)/median)\n' "$(range_pct "${RPS_VALUES[@]}")"
+printf '暖機          : %s 輪，收斂 %s\n' "$WARMUP_ROUNDS_USED" "$WARMUP_CONVERGED"
 if [ "$RUNS" -eq 1 ]; then
     echo "    （只量了一次，全距 0 代表「沒有可信度資訊」，不代表穩定）"
+fi
+
+echo
+echo "===== 失敗率（取自最後一次量測）====="
+FAILED_RATE=$(extract_counter "$LAST_LOG" 'http_req_failed')
+CLIENT_ERRORS=$(extract_counter "$LAST_LOG" 'client_errors')
+SERVER_ERRORS=$(extract_counter "$LAST_LOG" 'server_errors')
+printf 'http_req_failed : %s\n4xx（含 409）  : %s\n5xx             : %s\n' \
+    "${FAILED_RATE:-n/a}" "${CLIENT_ERRORS:-0}" "${SERVER_ERRORS:-0}"
+# **409 是策略正確運作的證據，不是故障。** 庫存不足、超過限購、重試耗盡、
+# 場次未開賣都回 409。相對地 5xx 才是系統故障，任何一個都代表這組數據不能用。
+if [ "${SERVER_ERRORS:-0}" != "0" ]; then
+    echo ">>> 警告：出現 ${SERVER_ERRORS} 個 5xx —— **本組數據不得採用**，須先查明原因"
+else
+    echo "（4xx 主要是 409：庫存不足／超過限購／重試耗盡，那是併發控制在生效）"
 fi
 
 echo
