@@ -4,11 +4,16 @@ import com.alantsai.ticketrush.application.facade.StrategyRegistry;
 import com.alantsai.ticketrush.application.metrics.RetryStatistics;
 import com.zaxxer.hikari.HikariDataSource;
 import javax.sql.DataSource;
+import org.apache.coyote.AbstractProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.boot.tomcat.TomcatWebServer;
+import org.springframework.boot.web.server.WebServer;
+import org.springframework.boot.web.server.servlet.context.ServletWebServerApplicationContext;
+import org.springframework.context.ApplicationContext;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 
@@ -34,18 +39,21 @@ public class RuntimeInfoLogger implements ApplicationRunner {
     private final DataSource dataSource;
     private final RetryStatistics retryStatistics;
     private final long reconciliationIntervalMs;
+    private final ApplicationContext applicationContext;
 
     public RuntimeInfoLogger(
             Environment environment,
             StrategyRegistry strategyRegistry,
             DataSource dataSource,
             RetryStatistics retryStatistics,
-            @Value("${ticket-rush.redis.reconciliation-interval-ms}") long reconciliationIntervalMs) {
+            @Value("${ticket-rush.redis.reconciliation-interval-ms}") long reconciliationIntervalMs,
+            ApplicationContext applicationContext) {
         this.environment = environment;
         this.strategyRegistry = strategyRegistry;
         this.dataSource = dataSource;
         this.retryStatistics = retryStatistics;
         this.reconciliationIntervalMs = reconciliationIntervalMs;
+        this.applicationContext = applicationContext;
     }
 
     @Override
@@ -61,6 +69,7 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 availableProcessors : {}
                 maxMemory (heap)    : {} MB
                 連線池上限          : {}
+                准入併發度上限      : {}
                 重試上限(樂觀鎖)    : {}
                 對帳間隔(Redis 預扣): {} ms
                 Redis               : {}
@@ -71,6 +80,9 @@ public class RuntimeInfoLogger implements ApplicationRunner {
                 runtime.availableProcessors(),
                 runtime.maxMemory() / BYTES_PER_MB,
                 maxPoolSize(),
+                // 執行緒模型只說明「用什麼執行緒」,不說明「同時放進來幾個」——
+                // 而後者直接決定有多少請求同時競爭連線池與資料庫的列鎖。
+                admissionLimit(),
                 // 從持有它的 bean 讀取，不讀設定值——與 CPU / heap / 連線池同樣的理由：
                 // 要報告的是實際生效的值。它只對樂觀鎖有意義，但仍一律輸出，
                 // 因為測量條件的表格不該有「這一組沒有這個欄位」的空洞。
@@ -95,5 +107,31 @@ public class RuntimeInfoLogger implements ApplicationRunner {
             return String.valueOf(hikari.getMaximumPoolSize());
         }
         return "未知(非 HikariCP:" + dataSource.getClass().getSimpleName() + ")";
+    }
+
+    /**
+     * 同時可進入應用處理的請求數上限。
+     *
+     * <p><b>取自 Tomcat 實際的 protocol handler,不取自 {@code server.tomcat.threads.max} 設定值。</b>
+     * 理由與連線池、CPU、heap 相同,但這裡的後果更嚴重:**啟用虛擬執行緒之後,
+     * 該設定仍可被賦值卻不再約束請求處理** —— 讀設定值會在條件表上寫下一個不是事實的數字,
+     * 而**條件表上錯誤的數字比缺漏的數字更危險:缺漏看得出來,錯誤看不出來。**
+     *
+     * <p>虛擬執行緒下 endpoint 的 executor 不是有上限的執行緒池,Tomcat 因此回傳 -1 ——
+     * 那正是「不受此上限約束」的實際訊號,據實呈現而不換算成任何數字。
+     */
+    private String admissionLimit() {
+        if (!(applicationContext instanceof ServletWebServerApplicationContext servletContext)) {
+            return "未知(非 Servlet 容器)";
+        }
+        WebServer webServer = servletContext.getWebServer();
+        if (!(webServer instanceof TomcatWebServer tomcat)) {
+            return "未知(非 Tomcat:" + webServer.getClass().getSimpleName() + ")";
+        }
+        if (!(tomcat.getTomcat().getConnector().getProtocolHandler() instanceof AbstractProtocol<?> protocol)) {
+            return "未知(非 AbstractProtocol)";
+        }
+        int maxThreads = protocol.getMaxThreads();
+        return maxThreads < 0 ? "不適用(虛擬執行緒,請求處理不受執行緒池上限約束)" : String.valueOf(maxThreads);
     }
 }
