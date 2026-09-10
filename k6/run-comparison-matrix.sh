@@ -140,8 +140,18 @@ for r in $(seq 1 "$ROUNDS"); do
         group_start=$(date +%s)
         elapsed=$(( group_start - START_EPOCH ))
 
+        # **postgres-perf 必須一起重建。** 資料目錄在 tmpfs，隨容器消滅；
+        # 而 pg_multixact 是 TRUNCATE / CHECKPOINT / VACUUM FREEZE 都清不掉的
+        # （截斷取決於整個 cluster 的 datminmxid，而 template0 的 datallowconn=false）。
+        #
+        # 第 13 支即毀於此：24 組跑下來累積 679MB，佔滿容器 1GB 上限的 68%，
+        # 三輪水位單調下降、漂移 21.2%，整批作廢。實測重建後 679M → 16K、91.29% → 17.95%。
+        #
+        # **兩個服務要寫在同一道指令裡。** 只重建 postgres 的話 app 會連著一個空資料庫，
+        # Flyway 不會重跑——症狀是 `relation "purchase_order" does not exist`。
+        # depends_on 已設 condition: service_healthy，compose 會先起 postgres 再起 app。
         STRATEGY="$st" MAX_ATTEMPTS=100 POOL_SIZE=50 VIRTUAL_THREADS="$vt" \
-            docker compose --profile perf up -d --force-recreate --wait app >/dev/null 2>&1
+            docker compose --profile perf up -d --force-recreate --wait postgres-perf app >/dev/null 2>&1
 
         log="$OUT_DIR/${label}_r${r}.log"
         RUNS=1 ./k6/run-load-test.sh > "$log" 2>&1 || true
@@ -162,9 +172,19 @@ for r in $(seq 1 "$ROUNDS"); do
         over=$(grep -m1 '超賣張數' "$log" | grep -oE '[0-9]+$' || echo "")
         e5=$(grep -m1 '5xx' "$log" | grep -oE '[0-9]+$' || echo "")
 
+        # **單一組量測失敗即整批中止，不是跳過那一格。**
+        #
+        # 跳過的話那一組只有兩個值、其他組有三個 —— 那是**不對稱**，也就是偏差，
+        # 而最後的表格會照常印出來，看起來與一批完整的數據沒有差別。
+        # 實際踩到：2026-09-09 OrbStack 中途被關掉，這一行印了「本組本輪作廢」之後
+        # 還繼續往下跑；若 Docker 只是抖一下就恢復，這批就會以「少一格」的狀態跑完。
         if [ -z "$rps" ]; then
-            echo "  ${label}：**量測失敗**（log 無吞吐數字）——本組本輪作廢"
-            continue
+            echo
+            echo ">>> **整批數據不可用** —— ${label}（第 ${r} 輪）量測失敗，log 中沒有吞吐數字。"
+            echo "    少掉一格會讓該組的樣本數與其他組不同,那是不對稱而非雜訊。"
+            echo "    log 末尾:"
+            tail -5 "$log" | sed 's/^/      /'
+            exit 1
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" >> "$RESULTS"
