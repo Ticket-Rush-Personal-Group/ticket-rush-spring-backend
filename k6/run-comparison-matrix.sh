@@ -386,12 +386,20 @@ for r in $(seq 1 "$ROUNDS"); do
         # CPU 成本。**吞吐是結果不是機制** —— 兩個組態可以有相同的吞吐而 CPU 差一倍。
         # 取機器可讀的那一行,不是人類可讀的對齊版面。
         cpu_line=$(grep -m1 'CPU 摘要' "$log" || true)
-        cpu_app=$(echo "$cpu_line" | sed -n 's/.*app=\([0-9.]*\).*/\1/p')
+        # **`[^_]` 前綴不可省。** `.*app=` 的貪婪比對會抓到**最後一個** `app=`,
+        # 而 `thr_app=0` 裡就有一個 —— 症狀是 CPU 數字全變成 0,看起來像探針壞了。
+        # 加一個欄位就靜默弄壞既有解析,而新欄位本身看起來完全無辜。
+        cpu_app=$(echo "$cpu_line" | sed -n 's/.*[^_]app=\([0-9.]*\).*/\1/p')
         cpu_asys=$(echo "$cpu_line" | sed -n 's/.*app_sys=\([0-9.]*\).*/\1/p')
         cpu_pg=$(echo "$cpu_line" | sed -n 's/.*[^_]pg=\([0-9.]*\).*/\1/p')
         cpu_psys=$(echo "$cpu_line" | sed -n 's/.*pg_sys=\([0-9.]*\).*/\1/p')
-        cpu_thr=$(echo "$cpu_line" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
-        if [ -z "$cpu_app" ] || [ -z "$cpu_thr" ]; then
+        # **判準加總,診斷逐容器。** 任一容器節流即整批不可用(加總判斷就夠),
+        # 但輸出必須說得出是誰 —— 否則下一步會走錯方向(第 17 支即因此把瓶頸歸給 app,
+        # 而實際上是 postgres,導致整支 change 的設計建立在錯的前提上)。
+        thr_app=$(echo "$cpu_line" | sed -n 's/.*thr_app=\([0-9]*\).*/\1/p')
+        thr_pg=$(echo "$cpu_line" | sed -n 's/.*thr_pg=\([0-9]*\).*/\1/p')
+        cpu_thr=$(( ${thr_app:-0} + ${thr_pg:-0} ))
+        if [ -z "$cpu_app" ] || [ -z "$thr_app" ] || [ -z "$thr_pg" ]; then
             echo
             echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)沒有 CPU 摘要。"
             echo "    探針取不到數字時不得留空繼續:輸出少一欄看起來像 grep 寫錯,"
@@ -404,7 +412,9 @@ for r in $(seq 1 "$ROUNDS"); do
         if [ "$cpu_thr" -gt 0 ]; then
             echo
             echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)量測期間撞到 CPU 配額"
-            echo "    (節流 ${cpu_thr} 次)。此時的吞吐由配額決定,不是由被測特性決定。"
+            echo "    **app 節流 ${thr_app} 次 / postgres 節流 ${thr_pg} 次** ——"
+            echo "    次數不為零的那一個才是瓶頸,解除它要調的是那個容器的配額。"
+            echo "    此時的吞吐由配額決定,不是由被測特性決定。"
             exit 1
         fi
 
