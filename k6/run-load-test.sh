@@ -45,11 +45,86 @@ WARMUP_CONVERGE_PCT="${WARMUP_CONVERGE_PCT:-5}"
 WARMUP_MAX_ROUNDS="${WARMUP_MAX_ROUNDS:-10}"
 # 快取的保存期限（秒）。預設一天，遠長於任何一次壓測。
 CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-86400}"
+# 環境健康的門檻：postgres 容器記憶體超過 mem_limit 的這個比例即中止。
+#
+# **判準取容器記憶體，不取 pg_multixact 的大小。** multixact 是這一次找到的累積物，
+# 第 11 支找到的是 WAL —— 兩次都是「量到單調下降之後回頭找」才發現的。
+# 針對已知的那一個寫檢查，擋得住的永遠只有上一次那個；而容器記憶體是
+# tmpfs、WAL、MultiXact、shared_buffers 共同的出口。
+#
+# 50% 的分離度是實測來的：乾淨時 17.95%、退化時 91.29%，兩邊各有兩倍以上餘裕。
+PG_MEM_ABORT_PCT="${PG_MEM_ABORT_PCT:-50}"
 
 # -q 不可省：INSERT ... RETURNING 會同時輸出 tuple 與 "INSERT 0 1" 這行 command status，
 # 後者會被一起吃進變數，造成下一句 SQL 語法錯誤。
 psql() { docker compose --profile perf exec -T postgres-perf psql -q -U postgres -d ticket_rush_db -tA "$@"; }
 redis_cli() { docker compose --profile perf exec -T redis-perf redis-cli "$@"; }
+
+# ---------------------------------------------------------------------------
+# 環境健康守則。
+#
+# 量測環境會在批次期間退化，而退化的症狀是**數字偏低**——那與一個正常的量測結果
+# 在輸出上完全沒有差別。第 13 支的整批數據就是這樣廢掉的：
+# pg_multixact 累積到 679MB 佔滿容器上限的 68%，三輪水位單調下降、漂移 21.2%。
+#
+# **這條守則的作用是讓退化中止批次，而不是讓它變成一個看起來合理的數字。**
+# ---------------------------------------------------------------------------
+pg_mem_pct() {
+    local cid
+    cid=$(docker compose --profile perf ps -q postgres-perf 2>/dev/null | head -1)
+    [ -z "$cid" ] && return 1
+    docker stats --no-stream --format '{{.MemPerc}}' "$cid" 2>/dev/null | tr -d '% '
+}
+
+# 資料目錄中某個子目錄的大小，供診斷用。**這是資訊，不是判準。**
+pg_dir_size() {
+    docker compose --profile perf exec -T postgres-perf \
+        du -sh "/var/lib/postgresql/data/pgdata/$1" 2>/dev/null | awk '{print $1}'
+}
+
+# 印出環境現況，並把結果放進三個全域變數供呼叫端判斷。
+# **用全域而不是回傳字串**——回傳的話呼叫端要 $( ) 捕捉，那會把印給人看的那一行一起吞掉。
+ENV_MEM_PCT=""
+ENV_MULTIXACT=""
+ENV_WAL=""
+report_env_state() {
+    # **讀不到就中止，不是略過。** 一個在讀不到時安靜放行的檢查，
+    # 與沒有檢查是同一件事——而它會在最需要它的時候失效。
+    if ! ENV_MEM_PCT=$(pg_mem_pct) || [ -z "$ENV_MEM_PCT" ]; then
+        echo ">>> 讀不到 postgres 容器的記憶體用量——**中止**。" >&2
+        echo "    環境健康無法確認時不產出數字。perf profile 起來了嗎？" >&2
+        exit 1
+    fi
+    ENV_MULTIXACT=$(pg_dir_size pg_multixact)
+    ENV_WAL=$(pg_dir_size pg_wal)
+    printf '環境（%s）: postgres 記憶體 %s%%  pg_multixact=%s  pg_wal=%s\n' \
+        "$1" "$ENV_MEM_PCT" "${ENV_MULTIXACT:-?}" "${ENV_WAL:-?}"
+}
+
+# 只有這一個檢查會中止，而且它只用在**暖機之前**。
+#
+# **兩個檢查點看到的東西性質不同：**
+#   暖機前——前面幾組留下來的累積。那是**偏差**，偏袒排在批次前面的組別，
+#            而偏差無法用增加量測次數消除。這正是本支要擋的東西。
+#   暖機後——本組自己的暖機產生的。那是**共同成本**，每一組都付、金額相同，
+#            跟 D1 說「重建 postgres 讓每組快取全冷，對八組是同等影響」是同一個道理。
+#
+# 實測（noLock，插入量最大的一層）：全新容器 15.16% → 暖機後 28.66%、pg_multixact 45M。
+# 暖機輪數會隨收斂速度變動，最壞情況更高——**對暖機後的水位套用同一個門檻會誤報**，
+# 而在 48 分鐘的矩陣中途誤報一次就是整批重來。
+assert_env_healthy() {
+    report_env_state "$1"
+    if awk -v p="$ENV_MEM_PCT" -v t="$PG_MEM_ABORT_PCT" 'BEGIN{exit !(p > t)}'; then
+        echo >&2
+        echo ">>> **量測環境已退化，中止。**" >&2
+        echo "    postgres 容器記憶體 ${ENV_MEM_PCT}%（門檻 ${PG_MEM_ABORT_PCT}%）" >&2
+        echo "    pg_multixact=${ENV_MULTIXACT:-?}  pg_wal=${ENV_WAL:-?}" >&2
+        echo "    資料目錄在 tmpfs，那些累積直接算進容器的 mem_limit。" >&2
+        echo "    **這是環境退化，不是量測結果** —— 此時量到的低數字無法與其他組比較。" >&2
+        echo "    處置：重建 postgres-perf 讓 tmpfs 隨容器消滅。" >&2
+        exit 1
+    fi
+}
 
 # 當前策略取自應用的啟動記錄，不是取自環境變數——
 # 第 4 支的教訓：compose 可能靜默替換容器，環境變數說的是「應該是什麼」而非「實際是什麼」。
@@ -198,6 +273,9 @@ TMPDIR_RUN=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_RUN"' EXIT
 
 echo "策略 ${STRATEGY_IN_USE}，初始庫存 ${INITIAL_STOCK}，${VUS} VU × ${ITERATIONS} 次 = $((VUS * ITERATIONS)) 個請求，量測 ${RUNS} 次"
+# 開場即檢查——**這一次要擋的是前面幾組留下來的累積**，
+# 而那在暖機之前就已經存在了。等到量測才發現，暖機那幾輪已經白跑。
+assert_env_healthy "暖機前"
 echo
 
 # ---------------------------------------------------------------------------
@@ -235,6 +313,12 @@ if [ "$WARMUP" = "true" ]; then
     fi
     echo
 fi
+
+# 暖機本身也在寫入（上限 10 輪 × 50000 個請求），因此正式量測前再印一次。
+# **這一次只印不中止**——本組暖機產生的量是每一組都付的共同成本，不是偏差。
+# 它進輸出是為了讓「這一組付了多少」可事後查核，不是為了否決它。
+report_env_state "暖機後"
+echo
 
 RPS_VALUES=()
 LAST_LOG=""

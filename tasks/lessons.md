@@ -290,3 +290,34 @@ redis_cli --scan --pattern 'purchased:*' | xargs -r redis_cli DEL >/dev/null 2>&
 **How to apply:** 帶參數驗證過之後,**再空跑一次預設路徑**確認它至少列印出正確的規模(本專案:確認 header 是「組別 8 個」)。這一步幾秒鐘,而它守的是一條 45 分鐘的批次。
 
 **取名的部分順帶記著:** shell 腳本的變數名要避開內建變數(`GROUPS`、`PIPESTATUS`、`SECONDS`、`LINENO`、`RANDOM`、`UID`…)。踩到時不會有任何警告,只會拿到一個看起來像「使用者沒設」的值。
+
+---
+
+### 2026-09-09 — `TRUNCATE`、`CHECKPOINT`、`VACUUM FREEZE` 都清不掉 `pg_multixact`
+
+**踩到什麼:** 交錯量測的八組矩陣整批作廢 —— 三輪水位 4622 → 4082 → 3759 req/s,漂移 21.2%(門檻 15%),八組中四組單調下降。第 11 支的教訓說「單調就代表有東西在累積」,於是回頭找是什麼。
+
+**是 `pg_multixact`,679MB。** 而壓測環境的資料目錄在 **tmpfs(記憶體)**,那 679MB 直接算進 postgres 容器的 `mem_limit: 1g` —— 容器來到 **91.29%**,整批最後一筆量測崩到 1084 req/s(同組前兩輪 4864 / 4665)。
+
+**成因是一個看起來完全無害的外鍵:** `purchase_order.event_id REFERENCES event(id)`。每一筆 insert 都要對**同一個** `event` 列做外鍵檢查,取 `FOR KEY SHARE` 鎖;而**當多個交易同時持有同一列的共享鎖,PostgreSQL 必須配置 MultiXactId 來記錄「誰和誰同時鎖著」**。1000 併發 × 24 次量測 = 120 萬筆 insert,全部指向同一個父列。
+
+**Why 清不掉:**
+
+| 做法 | 結果 |
+| --- | --- |
+| `TRUNCATE purchase_order, stock, event` | 679M 不動 |
+| `CHECKPOINT`(第 11 支修 WAL 的解) | 679M 不動 |
+| `VACUUM (FREEZE)` 三張表 | 679M 不動(`event.relminmxid` 有前進,但沒用) |
+| **重建容器** | **16K** |
+
+`pg_multixact` 的截斷取決於**整個 cluster 的 `datminmxid` 最小值**,而那要每個資料庫都做過全庫 vacuum 才會前進 —— 包含 `datallowconn=false` 的 `template0`。**在單一容器的生命週期內,這個累積清不掉。**
+
+**How to apply:**
+
+**① 量測環境的重置,唯一可靠的做法是重建容器。** 「清空資料表」只處理得掉資料表。第 11 支修 WAL 時加了 `CHECKPOINT`,那是對的,但它只修了當時找到的那一個 —— **而第二個累積物在量測次數變成三倍之後才顯現**(8 次量測時 multixact 還不夠大,24 次就滿了)。
+
+**② 因此環境健康的判準要取「共同的出口」,不要取已知的累積物。** 本專案的守則檢查的是**容器記憶體用量**,不是 `pg_multixact` 的大小 —— tmpfs、WAL、MultiXact、shared_buffers 全部算在同一個數字裡。**針對已知的那一個寫檢查,擋得住的永遠只有上一次那個。**
+
+**③ 這個現象本身值得記住,它不只是壓測環境的問題。** 「高頻插入的子表,外鍵指向一個熱點父列」在真實系統裡會產生大量 MultiXactId,**而症狀是逐漸變慢,不是報錯** —— 沒有測試會紅,監控上只是「資料庫好像有點慢」。本專案只是碰巧把量放大到看得見。
+
+**④ 順帶:只重建 postgres 而不重建應用,會得到 `relation "..." does not exist`。** Flyway 在應用啟動時才跑,資料庫換新的而應用沒重啟,schema 就不存在。兩個容器要寫在同一道 `docker compose up` 裡,靠 `depends_on: condition: service_healthy` 排序。
