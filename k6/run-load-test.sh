@@ -427,10 +427,17 @@ fi
 # 機器可讀的單行摘要，供編排腳本擷取。
 # **人類可讀的那幾行不適合被 grep** —— 欄位靠全形括號與空白對齊，
 # 改一次排版就會讓解析靜默失效，而症狀是「欄位空白」，看起來像 grep 寫錯。
+# **節流要逐容器輸出,不能加總。**
+# 加總過的欄位可以用來判斷「這批能不能用」,但**它藏起了「是誰撞牆」** ——
+# 而節流的處置是「找出瓶頸並解除它」,那必須知道是誰。
+#
+# 實際踩到:第 17 支輸出加總的 throttled,無鎖層報「節流 101 次」,
+# 於是我寫下「無鎖層把 app 的 4 核跑滿」並據此設計了一整支 change ——
+# 而那 101 次幾乎全是 postgres 的,app 全程只用 25～37%。**降載因此完全無效。**
 awk -v au="$APP_USAGE_D" -v ay="$APP_SYS_D" -v pu="$PG_USAGE_D" -v py="$PG_SYS_D" \
-    -v req="$TOTAL_REQ" -v thr="$((APP_THR_D + PG_THR_D))" 'BEGIN {
-    printf "CPU 摘要      : app=%.3f app_sys=%.3f pg=%.3f pg_sys=%.3f throttled=%d\n",
-        au/req/1000, ay/req/1000, pu/req/1000, py/req/1000, thr
+    -v req="$TOTAL_REQ" -v ta="$APP_THR_D" -v tp="$PG_THR_D" 'BEGIN {
+    printf "CPU 摘要      : app=%.3f app_sys=%.3f pg=%.3f pg_sys=%.3f thr_app=%d thr_pg=%d\n",
+        au/req/1000, ay/req/1000, pu/req/1000, py/req/1000, ta, tp
 }'
 if [ "$RUNS" -eq 1 ]; then
     echo "    （只量了一次，全距 0 代表「沒有可信度資訊」，不代表穩定）"
