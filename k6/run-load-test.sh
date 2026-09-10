@@ -76,6 +76,42 @@ pg_mem_pct() {
     docker stats --no-stream --format '{{.MemPerc}}' "$cid" 2>/dev/null | tr -d '% '
 }
 
+# ---------------------------------------------------------------------------
+# CPU 探針。
+#
+# **吞吐是結果，不是機制。** 兩個組態可以有相同的吞吐而 CPU 差一倍，也可以有相同的
+# CPU 而吞吐差一倍——那兩種情況指向完全相反的結論，在吞吐數字上卻長得一模一樣。
+#
+# **讀累計計數器，不用 docker stats 的瞬時值。** 量測窗口只有約 20 秒，
+# 要用瞬時值就得在跑的期間持續抽樣，**而抽樣器本身會跟被測系統搶 CPU** ——
+# 那正是這裡要量的東西。
+#
+# **user / system 必須分開。** 執行緒的建立、切換與排程是**核心**的工作，
+# 合計值分不出「應用做了更多事」與「核心花了更多力氣調度」，
+# 而那兩者對「執行緒模型的成本」給出相反的答案。
+# ---------------------------------------------------------------------------
+CPU_USAGE=""; CPU_USER=""; CPU_SYS=""; CPU_THROTTLED=""; CPU_QUOTA=""
+read_cpu_stat() {
+    # **服務名要先存起來。** 下面的 `set --` 會覆寫位置參數，
+    # 之後的 $1 是 usage 數字而不是服務名——錯誤訊息會印出一個看不懂的東西。
+    local svc="$1" out
+    # cpu.max 也一起讀——配額要由被測容器自報，不由人抄 compose。
+    out=$(docker compose --profile perf exec -T "$svc" sh -c \
+        'cat /sys/fs/cgroup/cpu.stat; printf "cpu_max %s\n" "$(cat /sys/fs/cgroup/cpu.max)"' 2>/dev/null \
+        | awk '/^usage_usec/{u=$2} /^user_usec/{us=$2} /^system_usec/{s=$2}
+               /^nr_throttled/{t=$2} /^cpu_max/{q=($2=="max"?0:$2/$3)}
+               END{printf "%s %s %s %s %s", u, us, s, (t==""?0:t), (q==""?0:q)}')
+    set -- $out
+    CPU_USAGE="${1:-}"; CPU_USER="${2:-}"; CPU_SYS="${3:-}"
+    CPU_THROTTLED="${4:-0}"; CPU_QUOTA="${5:-0}"
+    # **讀不到就中止。** 留空繼續的話，輸出裡少一欄看起來像 grep 寫錯，
+    # 而實際上可能是別的東西壞了——第 15 支才剛因此查錯方向。
+    if [ -z "$CPU_USAGE" ]; then
+        echo ">>> 讀不到 ${svc} 容器的 cgroup cpu.stat——**中止**。" >&2
+        return 1
+    fi
+}
+
 # 資料目錄中某個子目錄的大小，供診斷用。**這是資訊，不是判準。**
 pg_dir_size() {
     docker compose --profile perf exec -T postgres-perf \
@@ -324,11 +360,34 @@ RPS_VALUES=()
 LAST_LOG=""
 DRAIN_MS=0
 
+# CPU 累計量。**括號只包住 k6 執行與非同步落庫收斂**——
+# 重置與暖機不算進去，要歸給這次量測的是這一段。
+APP_USAGE_D=0; APP_USER_D=0; APP_SYS_D=0; APP_THR_D=0
+PG_USAGE_D=0;  PG_USER_D=0;  PG_SYS_D=0;  PG_THR_D=0
+WALL_D=0; TOTAL_REQ=0; APP_QUOTA=0; PG_QUOTA=0
+
 for i in $(seq 1 "$RUNS"); do
     echo "===== 量測 ${i}/${RUNS} ====="
     reset_data
+
+    read_cpu_stat app
+    a0u=$CPU_USAGE; a0s=$CPU_USER; a0y=$CPU_SYS; a0t=$CPU_THROTTLED; APP_QUOTA=$CPU_QUOTA
+    read_cpu_stat postgres-perf
+    p0u=$CPU_USAGE; p0s=$CPU_USER; p0y=$CPU_SYS; p0t=$CPU_THROTTLED; PG_QUOTA=$CPU_QUOTA
+    w0=$(date +%s)
+
     run_k6 "$TMPDIR_RUN/run_$i.log"
     DRAIN_MS=$(drain_async_persistence)
+
+    w1=$(date +%s)
+    read_cpu_stat app
+    APP_USAGE_D=$((APP_USAGE_D + CPU_USAGE - a0u)); APP_USER_D=$((APP_USER_D + CPU_USER - a0s))
+    APP_SYS_D=$((APP_SYS_D + CPU_SYS - a0y));       APP_THR_D=$((APP_THR_D + CPU_THROTTLED - a0t))
+    read_cpu_stat postgres-perf
+    PG_USAGE_D=$((PG_USAGE_D + CPU_USAGE - p0u));   PG_USER_D=$((PG_USER_D + CPU_USER - p0s))
+    PG_SYS_D=$((PG_SYS_D + CPU_SYS - p0y));         PG_THR_D=$((PG_THR_D + CPU_THROTTLED - p0t))
+    WALL_D=$((WALL_D + w1 - w0)); TOTAL_REQ=$((TOTAL_REQ + VUS * ITERATIONS))
+
     LAST_LOG="$TMPDIR_RUN/run_$i.log"
 
     rps=$(extract_rps "$LAST_LOG")
@@ -343,6 +402,36 @@ printf '中位數        : %s req/s\n' "$(median "${RPS_VALUES[@]}")"
 # 全距是這份輸出裡最重要的一個數字：兩組數據的差距若小於全距，就不能下結論。
 printf '>>> 全距      : %s%%   ((max-min)/median)\n' "$(range_pct "${RPS_VALUES[@]}")"
 printf '暖機          : %s 輪，收斂 %s\n' "$WARMUP_ROUNDS_USED" "$WARMUP_CONVERGED"
+
+echo
+echo "===== CPU 成本 ====="
+# **以「每請求」呈現，不是總量也不是使用率。**
+# 總量隨吞吐變動、使用率隨窗口變動——只有每請求的成本可以跨組態比較。
+awk -v au="$APP_USAGE_D" -v as="$APP_USER_D" -v ay="$APP_SYS_D" \
+    -v pu="$PG_USAGE_D" -v ps="$PG_USER_D" -v py="$PG_SYS_D" \
+    -v req="$TOTAL_REQ" -v wall="$WALL_D" -v aq="$APP_QUOTA" -v pq="$PG_QUOTA" 'BEGIN {
+    printf "app           : %.3f 毫秒/請求（user %.3f / system %.3f）\n", au/req/1000, as/req/1000, ay/req/1000
+    printf "postgres      : %.3f 毫秒/請求（user %.3f / system %.3f）\n", pu/req/1000, ps/req/1000, py/req/1000
+    if (wall > 0 && aq > 0) printf "使用率        : app %.0f%% / %g 核", au/1e6/wall/aq*100, aq
+    if (wall > 0 && pq > 0) printf "   postgres %.0f%% / %g 核", pu/1e6/wall/pq*100, pq
+    printf "\n              （分母為牆鐘 %d 秒，解析度 1 秒——每請求成本不受此影響）\n", wall
+}'
+# **節流要能否決這一組。** 撞到配額時吞吐是被上限決定的，不是被被測特性決定的，
+# 而症狀只是「數字比預期低」，與真實的效能差異分不出來。
+printf 'CPU 節流      : app %s 次 / postgres %s 次' "$APP_THR_D" "$PG_THR_D"
+if [ "$APP_THR_D" -gt 0 ] || [ "$PG_THR_D" -gt 0 ]; then
+    printf '   >>> **本組不得用於比較** —— 量測期間撞到 CPU 配額\n'
+else
+    printf '\n'
+fi
+# 機器可讀的單行摘要，供編排腳本擷取。
+# **人類可讀的那幾行不適合被 grep** —— 欄位靠全形括號與空白對齊，
+# 改一次排版就會讓解析靜默失效，而症狀是「欄位空白」，看起來像 grep 寫錯。
+awk -v au="$APP_USAGE_D" -v ay="$APP_SYS_D" -v pu="$PG_USAGE_D" -v py="$PG_SYS_D" \
+    -v req="$TOTAL_REQ" -v thr="$((APP_THR_D + PG_THR_D))" 'BEGIN {
+    printf "CPU 摘要      : app=%.3f app_sys=%.3f pg=%.3f pg_sys=%.3f throttled=%d\n",
+        au/req/1000, ay/req/1000, pu/req/1000, py/req/1000, thr
+}'
 if [ "$RUNS" -eq 1 ]; then
     echo "    （只量了一次，全距 0 代表「沒有可信度資訊」，不代表穩定）"
 fi
