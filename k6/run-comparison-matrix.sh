@@ -42,6 +42,15 @@ ROUNDS="${ROUNDS:-3}"
 # 漂移門檻:三輪環境水位的全距若超過它，整批數據不可用。
 # **一個永遠不會失敗的驗收不是驗收。**
 DRIFT_THRESHOLD="${DRIFT_THRESHOLD:-15}"
+# 單組全距的上限。**漂移看的是每輪的水位,不是每組的離散度** ——
+# 一筆脫序的量測藏在單一組裡時,水位幾乎不動(漂移照樣過關),但那一組已經廢了。
+#
+# 全距本來就印在輸出上,**而印出來卻沒有任何東西根據它做判斷,
+# 就是「一個永遠不會失敗的驗收」。**
+#
+# 25% 的依據是歷史批次:有效批次的單組全距落在 2%～12.3%,
+# **門檻訂在那之上一截,而不是訂在讓某一批剛好通過的位置。**
+GROUP_RANGE_MAX="${GROUP_RANGE_MAX:-25}"
 # 單組耗時上限。正常一組約 55～130 秒（含重啟與暖到收斂）；遠超過它代表機器中途睡著或
 # 被別的東西卡住，**而不是這一組比較慢**。
 MAX_GROUP_SECONDS="${MAX_GROUP_SECONDS:-420}"
@@ -117,7 +126,7 @@ OUT_DIR=$(mktemp -d)
 RESULTS="$OUT_DIR/results.tsv"
 trap 'rm -rf "$OUT_DIR"' EXIT
 # dur_s 附在最後一欄 —— 前面幾欄的位置是統計用 awk 的 $2 / $3 / $4,不動它們。
-printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\tadmission\tapp_mem_pct\n' > "$RESULTS"
+printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\tadmission\tapp_mem_pct\tcpu_app_ms\tcpu_app_sys_ms\tcpu_pg_ms\tcpu_pg_sys_ms\n' > "$RESULTS"
 
 # 統計輔助:與 run-load-test.sh 使用完全相同的定義。
 # **全距一律為 (max-min)/median** —— 換分母就能讓任何修正看起來有效。
@@ -301,6 +310,7 @@ echo "==================== 交錯量測矩陣 ===================="
 echo "組別 ${GROUP_COUNT} 個 × ${ROUNDS} 輪 = $((GROUP_COUNT * ROUNDS)) 次重啟"
 echo "每次重啟都含「暖到收斂」——暖度綁在 JVM 實例上，重啟就沒了，這一項無法省。"
 echo "漂移門檻：${DRIFT_THRESHOLD}%（超過即整批不可用）"
+echo "單組全距上限：${GROUP_RANGE_MAX}%（超過即該組不可用——漂移抓不到組內的離散）"
 echo "單組耗時上限：${MAX_GROUP_SECONDS}s（超過即中止，代表機器中途睡著或被卡住）"
 echo "電源：${POWER_SOURCE:-未知}（電量 ${BATTERY_PCT:-?}%）—— 電源是量測條件的一部分。"
 echo
@@ -373,6 +383,31 @@ for r in $(seq 1 "$ROUNDS"); do
             exit 1
         fi
 
+        # CPU 成本。**吞吐是結果不是機制** —— 兩個組態可以有相同的吞吐而 CPU 差一倍。
+        # 取機器可讀的那一行,不是人類可讀的對齊版面。
+        cpu_line=$(grep -m1 'CPU 摘要' "$log" || true)
+        cpu_app=$(echo "$cpu_line" | sed -n 's/.*app=\([0-9.]*\).*/\1/p')
+        cpu_asys=$(echo "$cpu_line" | sed -n 's/.*app_sys=\([0-9.]*\).*/\1/p')
+        cpu_pg=$(echo "$cpu_line" | sed -n 's/.*[^_]pg=\([0-9.]*\).*/\1/p')
+        cpu_psys=$(echo "$cpu_line" | sed -n 's/.*pg_sys=\([0-9.]*\).*/\1/p')
+        cpu_thr=$(echo "$cpu_line" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
+        if [ -z "$cpu_app" ] || [ -z "$cpu_thr" ]; then
+            echo
+            echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)沒有 CPU 摘要。"
+            echo "    探針取不到數字時不得留空繼續:輸出少一欄看起來像 grep 寫錯,"
+            echo "    而實際上可能是別的東西壞了。log 末尾:"
+            tail -5 "$log" | sed 's/^/      /'
+            exit 1
+        fi
+        # **節流不為零即整批中止** —— 與記憶體守則同一個處置。
+        # 撞到配額時吞吐是被上限決定的,而症狀只是「數字比預期低」。
+        if [ "$cpu_thr" -gt 0 ]; then
+            echo
+            echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)量測期間撞到 CPU 配額"
+            echo "    (節流 ${cpu_thr} 次)。此時的吞吐由配額決定,不是由被測特性決定。"
+            exit 1
+        fi
+
         rps=$(grep -m1 '中位數' "$log" | grep -oE '[0-9.]+' || echo "")
         sold=$(grep -m1 '累計售出' "$log" | grep -oE '[0-9]+$' || echo "")
         over=$(grep -m1 '超賣張數' "$log" | grep -oE '[0-9]+$' || echo "")
@@ -392,24 +427,41 @@ for r in $(seq 1 "$ROUNDS"); do
             tail -5 "$log" | sed 's/^/      /'
             exit 1
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" "$adm" \
-            "${appmem:-?}" >> "$RESULTS"
-        printf '  %-20s %10s req/s   准入=%-8s t=%ss  耗時=%ss  app記憶體=%s%%  售出=%-6s 超賣=%-6s 5xx=%s\n' \
-            "$label" "$rps" "$adm" "$elapsed" "$dur" "${appmem:-?}" "${sold:-?}" "${over:-?}" "${e5:-?}"
+            "${appmem:-?}" "$cpu_app" "$cpu_asys" "$cpu_pg" "$cpu_psys" >> "$RESULTS"
+        printf '  %-20s %10s req/s   准入=%-8s CPU app=%s(sys %s) pg=%s  t=%ss 耗時=%ss  售出=%-6s 超賣=%-6s 5xx=%s\n' \
+            "$label" "$rps" "$adm" "$cpu_app" "$cpu_asys" "$cpu_pg" \
+            "$elapsed" "$dur" "${sold:-?}" "${over:-?}" "${e5:-?}"
     done
     echo
 done
 
+BAD_GROUPS=0
 echo "==================== 每組結果 ===================="
 printf '%-20s %-28s %-12s %-8s\n' 組別 各輪 中位數 全距
 for label in $(group_list); do
     vals=$(awk -F'\t' -v l="$label" '$1==l{print $4}' "$RESULTS")
     [ -z "$vals" ] && continue
     # shellcheck disable=SC2086
-    printf '%-20s %-28s %-12s %-8s\n' "$label" \
-        "$(echo $vals | sed 's/ / \/ /g')" "$(median $vals)" "$(range_pct $vals)%"
+    grp_range=$(range_pct $vals)
+    flag=""
+    if awk -v g="$grp_range" -v t="$GROUP_RANGE_MAX" 'BEGIN{exit !(g > t)}'; then
+        flag="   <<< **本組不可用**(超過 ${GROUP_RANGE_MAX}%)"
+        BAD_GROUPS=$((BAD_GROUPS + 1))
+    fi
+    # shellcheck disable=SC2086
+    printf '%-20s %-28s %-12s %-8s%s\n' "$label" \
+        "$(echo $vals | sed 's/ / \/ /g')" "$(median $vals)" "${grp_range}%" "$flag"
 done
+
+if [ "$BAD_GROUPS" -gt 0 ]; then
+    echo
+    echo ">>> **整批數據不可用** —— ${BAD_GROUPS} 個組別的全距超過 ${GROUP_RANGE_MAX}%。"
+    echo "    漂移看的是每輪的水位,抓不到藏在單一組裡的離散 ——"
+    echo "    一筆脫序的量測幾乎不動水位,但那一組已經廢了。"
+    echo "    **差距小於較不穩定那一方的全距時不得下結論,而該組的全距已經大到任何比較都無效。**"
+fi
 
 echo
 echo "==================== 環境漂移 ===================="
