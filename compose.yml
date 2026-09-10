@@ -41,6 +41,14 @@ services:
       # 啟動時設定，無法於執行期切換——這是「啟動兩次跑八組」的原因
       SPRING_THREADS_VIRTUAL_ENABLED: "${VIRTUAL_THREADS:-false}"
       TICKET_RUSH_STRATEGY: "${STRATEGY:-noLock}"
+      # 請求的准入併發度上限，用於「虛擬 vs 平台的差異是否來自准入節流」的判別實驗。
+      #
+      # **預設 200 即 Spring Boot 原本的實際生效值** —— 先前完全沒設，吃的就是這個預設，
+      # 所以顯式帶 200 與改版前行為相同。
+      #
+      # **這個值對虛擬執行緒不生效**：啟用虛擬執行緒後請求處理不再受執行緒池約束，
+      # 但這個環境變數仍可被賦值。因此測量條件一律以應用自報的實際值為準，不以此處為準。
+      SERVER_TOMCAT_THREADS_MAX: "${TOMCAT_THREADS:-200}"
       # 連線池大小可由外部覆寫，用於「等鎖 vs 等連線」的對照實驗。
       # 兩者在延遲圖表上長得一模一樣，改變連線池是最直接的區分方式。
       SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-50}"

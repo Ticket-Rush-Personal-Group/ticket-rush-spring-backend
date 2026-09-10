@@ -51,7 +51,8 @@ MAX_GROUP_SECONDS="${MAX_GROUP_SECONDS:-420}"
 # 水位算得出來,但「機器睡了六小時」不在那個指標裡。
 POWER_SOURCE=$(pmset -g batt 2>/dev/null | sed -n "1s/.*'\(.*\)'.*/\1/p")
 BATTERY_PCT=$(pmset -g batt 2>/dev/null | sed -n '2s/.*[^0-9]\([0-9][0-9]*\)%.*/\1/p')
-if [ -n "$POWER_SOURCE" ] && [ "$POWER_SOURCE" != "AC Power" ] && [ -z "${ALLOW_BATTERY:-}" ]; then
+if [ -n "$POWER_SOURCE" ] && [ "$POWER_SOURCE" != "AC Power" ] \
+    && [ -z "${ALLOW_BATTERY:-}" ] && [ -z "${MATRIX_RESOLVE_ONLY:-}" ]; then
     echo "電源為「${POWER_SOURCE}」(電量 ${BATTERY_PCT:-?}%)——批次中止。" >&2
     echo "45 分鐘的批次在電池上跑,放電曲線會成為一個漸變的隱藏變數;低電量還會直接進入" >&2
     echo "idle sleep 把整批凍住。接上電源再跑,或明確設 ALLOW_BATTERY=1。" >&2
@@ -67,30 +68,56 @@ ALL_GROUPS="P_noLock P_pessimistic P_optimistic P_redisPreDeduct V_noLock V_pess
 # 所以驗證通過、完整矩陣才炸。**能被參數覆寫掩蓋的預設值,驗證時要連預設路徑一起走。**
 MATRIX_GROUPS="${MATRIX_GROUPS:-$ALL_GROUPS}"
 
-# label → 策略與執行緒模型。以 case 而非關聯陣列表達，維持 bash 3.2 相容。
-strategy_of() {
+# label 格式：**<模型><准入上限>_<策略>**
+#
+#   P_noLock           → 平台 / 准入上限用應用預設 / noLock
+#   P1000_pessimistic  → 平台 / 准入上限 1000     / pessimistic
+#   V_noLock           → 虛擬 / 上限不適用         / noLock
+#
+# 取代原本 strategy_of / virtual_of 兩份寫死的 case 清單 ——
+# 那兩份清單每加一個維度就要改兩處，而這段解析加維度不必改。**行數也比原本少。**
+#
+# **向下相容是硬需求：** 預設八組（P_noLock…）是 Phase 1 已封存數據的來源，
+# 准入上限留空即沿用應用預設（200），行為與改版前完全相同。
+#
+# 結果放全域而非回傳字串：一次解析要吐三個值，三次 $( ) 就是三次 fork。
+LABEL_MODEL=""
+LABEL_THREADS=""
+LABEL_STRATEGY=""
+parse_label() {
+    local prefix
     case "$1" in
-        P_noLock|V_noLock) echo noLock ;;
-        P_pessimistic|V_pessimistic) echo pessimistic ;;
-        P_optimistic|V_optimistic) echo optimistic ;;
-        P_redisPreDeduct|V_redisPreDeduct) echo redisPreDeduct ;;
-        *) echo "未知的組別:$1" >&2; return 1 ;;
+        *_*) : ;;
+        *) echo "組別格式錯誤：$1（應為 <模型><准入上限>_<策略>）" >&2; return 1 ;;
     esac
-}
-
-virtual_of() {
-    case "$1" in
-        P_*) echo false ;;
-        V_*) echo true ;;
-        *) echo "未知的組別:$1" >&2; return 1 ;;
+    prefix="${1%%_*}"
+    LABEL_STRATEGY="${1#*_}"
+    # **策略要白名單，不能照單全收。** 打錯字若被當成合法策略，
+    # 應用會退回預設策略而照樣跑完，得到的是「一組標錯名字的數據」。
+    case "$LABEL_STRATEGY" in
+        noLock|pessimistic|optimistic|redisPreDeduct) : ;;
+        *) echo "未知的策略：${LABEL_STRATEGY}（來自組別 $1）" >&2; return 1 ;;
     esac
+    case "$prefix" in
+        P) LABEL_MODEL=false; LABEL_THREADS="" ;;
+        V) LABEL_MODEL=true;  LABEL_THREADS="" ;;
+        P[0-9]*) LABEL_MODEL=false; LABEL_THREADS="${prefix#P}" ;;
+        V[0-9]*) LABEL_MODEL=true;  LABEL_THREADS="${prefix#V}" ;;
+        *) echo "未知的模型前綴：${prefix}（來自組別 $1）" >&2; return 1 ;;
+    esac
+    # P12a 會通過上面的 P[0-9]* 而留下 "12a"。數字部分必須全是數字。
+    if [ -n "$LABEL_THREADS" ]; then
+        case "$LABEL_THREADS" in
+            *[!0-9]*) echo "准入上限不是數字：${LABEL_THREADS}（來自組別 $1）" >&2; return 1 ;;
+        esac
+    fi
 }
 
 OUT_DIR=$(mktemp -d)
 RESULTS="$OUT_DIR/results.tsv"
 trap 'rm -rf "$OUT_DIR"' EXIT
 # dur_s 附在最後一欄 —— 前面幾欄的位置是統計用 awk 的 $2 / $3 / $4,不動它們。
-printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\n' > "$RESULTS"
+printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\tadmission\tapp_mem_pct\n' > "$RESULTS"
 
 # 統計輔助:與 run-load-test.sh 使用完全相同的定義。
 # **全距一律為 (max-min)/median** —— 換分母就能讓任何修正看起來有效。
@@ -116,6 +143,41 @@ group_list() {
 }
 
 GROUP_COUNT=$(group_list | wc -l | tr -d ' ')
+
+# 只解析不執行。**把「走一次預設路徑」從「開一次矩陣」變成一秒鐘的事。**
+#
+# 那條教訓的成本原本很高：驗證都會帶參數（為了縮小規模），而正式跑的是預設值，
+# 兩條是不同的路徑——`GROUPS` 是 bash 內建變數那次就是這樣躲過驗證的。
+# 檢查便宜到可以每次都做，它才真的會被做。
+if [ -n "${MATRIX_RESOLVE_ONLY:-}" ]; then
+    printf '%-22s %-8s %-14s %s\n' 組別 模型 准入上限 策略
+    for label in $(group_list); do
+        parse_label "$label"
+        # 虛擬執行緒不受 tomcat 執行緒上限約束 —— **印「200」會是一個不是事實的數字**，
+        # 而條件表上錯誤的數字比缺漏的更危險：缺漏看得出來，錯誤看不出來。
+        if [ "$LABEL_MODEL" = true ]; then
+            printf '%-22s %-8s %-14s %s\n' "$label" 虛擬 "不適用" "$LABEL_STRATEGY"
+        else
+            printf '%-22s %-8s %-14s %s\n' "$label" 平台 "${LABEL_THREADS:-200(預設)}" "$LABEL_STRATEGY"
+        fi
+    done
+    echo
+    echo "組別 ${GROUP_COUNT} 個 × ${ROUNDS} 輪 = $((GROUP_COUNT * ROUNDS)) 次重啟"
+    exit 0
+fi
+
+# **先建一次 image。** 每組的 `up --force-recreate` 只重建容器,不重建 image ——
+# 改了應用程式碼卻沒重建,量到的是舊 jar,而且**沒有任何徵兆**:
+# 容器是新的、設定是新的、日誌照常輸出,只有 jar 是舊的。
+# 本支就踩到了(新增的測量條件那一行整個沒出現,看起來像 grep 寫錯)。
+#
+# 建一次而不是每組帶 --build:一次就夠,而每組帶等於 18 次快取檢查。
+echo "建置 app image(避免量到舊 jar)…"
+docker compose --profile perf build app >/dev/null 2>&1 || {
+    echo ">>> app image 建置失敗 —— 中止。" >&2
+    exit 1
+}
+
 START_EPOCH=$(date +%s)
 
 echo "==================== 交錯量測矩陣 ===================="
@@ -135,8 +197,11 @@ for r in $(seq 1 "$ROUNDS"); do
 
     echo "########## 第 ${r} 輪（起點偏移 ${offset}）##########"
     for label in $ordered; do
-        st=$(strategy_of "$label")
-        vt=$(virtual_of "$label")
+        parse_label "$label"
+        st="$LABEL_STRATEGY"
+        vt="$LABEL_MODEL"
+        # 留空即用應用預設 200 —— 顯式帶 200 與先前「完全不設」的實際生效值相同。
+        tm="${LABEL_THREADS:-200}"
         group_start=$(date +%s)
         elapsed=$(( group_start - START_EPOCH ))
 
@@ -150,8 +215,21 @@ for r in $(seq 1 "$ROUNDS"); do
         # **兩個服務要寫在同一道指令裡。** 只重建 postgres 的話 app 會連著一個空資料庫，
         # Flyway 不會重跑——症狀是 `relation "purchase_order" does not exist`。
         # depends_on 已設 condition: service_healthy，compose 會先起 postgres 再起 app。
-        STRATEGY="$st" MAX_ATTEMPTS=100 POOL_SIZE=50 VIRTUAL_THREADS="$vt" \
+        STRATEGY="$st" MAX_ATTEMPTS=100 POOL_SIZE=50 VIRTUAL_THREADS="$vt" TOMCAT_THREADS="$tm" \
             docker compose --profile perf up -d --force-recreate --wait postgres-perf app >/dev/null 2>&1
+
+        # **准入上限取自應用自報,不取自我們剛才傳出去的值。**
+        # 傳出去的是「應該是什麼」,自報的是「實際是什麼」——第 4 支的教訓。
+        # 這一欄同時是 spec 要求的測量條件:效能數據必須附帶准入併發度上限。
+        adm=$(docker compose --profile perf logs app 2>/dev/null \
+            | grep -m1 '准入併發度上限' | sed 's/^.*上限 *: *//' | tr -d '\r' || true)
+        if [ -z "$adm" ]; then
+            echo
+            echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)的應用沒有報告准入上限。"
+            echo "    最可能的原因是跑的是舊 jar(image 未重建)。**那會讓整批量到錯的東西。**"
+            exit 1
+        fi
+        case "$adm" in 不適用*) adm=不適用 ;; esac
 
         log="$OUT_DIR/${label}_r${r}.log"
         RUNS=1 ./k6/run-load-test.sh > "$log" 2>&1 || true
@@ -164,6 +242,19 @@ for r in $(seq 1 "$ROUNDS"); do
             echo ">>> **整批數據不可用** —— ${label}（第 ${r} 輪）耗時 ${dur}s，"
             echo "    超過單組上限 ${MAX_GROUP_SECONDS}s。機器極可能在量測期間睡眠或被其他負載卡住，"
             echo "    這一組的數字不是量測結果，而其後所有組別與前面幾輪已不在同一個時間脈絡上。"
+            exit 1
+        fi
+
+        # app 容器記憶體。**1000 條平台執行緒的堆疊是本支的已知風險** ——
+        # 每條預設 1MB,保留空間約 1GB,而容器上限 2g、heap 1536MB。
+        # 觸及上限時量到的是「記憶體不夠」,不是「平台在高併發下比較慢」,
+        # **而那兩者在吞吐數字上長得一模一樣。**
+        appmem=$(docker stats --no-stream --format '{{.MemPerc}}' \
+            "$(docker compose --profile perf ps -q app)" 2>/dev/null | tr -d '% ' || echo "")
+        if [ -n "$appmem" ] && awk -v m="$appmem" 'BEGIN{exit !(m > 90)}'; then
+            echo
+            echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)的 app 容器記憶體達 ${appmem}%。"
+            echo "    此時量到的是資源不足,不是該組態的效能特性,兩者在吞吐上無法分辨。"
             exit 1
         fi
 
@@ -186,10 +277,11 @@ for r in $(seq 1 "$ROUNDS"); do
             tail -5 "$log" | sed 's/^/      /'
             exit 1
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" >> "$RESULTS"
-        printf '  %-20s %10s req/s   t=%ss  耗時=%ss  售出=%-6s 超賣=%-6s 5xx=%s\n' \
-            "$label" "$rps" "$elapsed" "$dur" "${sold:-?}" "${over:-?}" "${e5:-?}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" "$adm" \
+            "${appmem:-?}" >> "$RESULTS"
+        printf '  %-20s %10s req/s   准入=%-8s t=%ss  耗時=%ss  app記憶體=%s%%  售出=%-6s 超賣=%-6s 5xx=%s\n' \
+            "$label" "$rps" "$adm" "$elapsed" "$dur" "${appmem:-?}" "${sold:-?}" "${over:-?}" "${e5:-?}"
     done
     echo
 done
