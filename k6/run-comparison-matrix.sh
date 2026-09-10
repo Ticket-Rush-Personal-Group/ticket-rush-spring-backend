@@ -144,6 +144,94 @@ group_list() {
 
 GROUP_COUNT=$(group_list | wc -l | tr -d ' ')
 
+# ---------------------------------------------------------------------------
+# 排程。**抽成函式讓「檢查」與「實際執行」共用同一份邏輯** ——
+# 兩份實作必然漂移,而漂移的症狀是「檢查通過但跑起來不是那樣」。
+# ---------------------------------------------------------------------------
+# 正向輪的數量。偶數輪都是反序,不佔旋轉的位置。
+FWD_ROUNDS=$(( (ROUNDS + 1) / 2 ))
+
+# **偶數輪 = 前一輪的完整反序;奇數輪 = 正向旋轉。**
+#
+# 為什麼不是「旋轉之後再把偶數輪反轉」—— 那個直覺的做法是錯的:
+# 設配對三輪的先後為 (f₁,f₂,f₃),反轉第 2 輪得到 (f₁,¬f₂,f₃),於是
+#   (先,先,先) 3:0 → (先,後,先) 2:1  改善
+#   (先,後,先) 2:1 → (先,先,先) 3:0  **惡化**
+# **它把一部分配對修好,同時把另一部分弄壞。**
+#
+# 完整反序則翻轉**所有**配對,因此第 1、2 輪對任一配對必定各得一次,
+# 第 3 輪不論怎麼排都只能讓它成為 2:1 —— **對所有配對同時成立,無一例外。**
+# 輪數為奇數時 2:1 即理論上界(兩個非負整數相加為奇數就不可能相等)。
+#
+# 正向輪之間仍然旋轉,因為反序只解決先後、不解決絕對位置 ——
+# 兩種偏差要同時處理。
+round_order() {
+    local r="$1" m offset
+    if [ $((r % 2)) -eq 0 ]; then
+        round_order $((r - 1)) | awk '{a[NR]=$0} END {for (i=NR;i>=1;i--) print a[i]}'
+        return
+    fi
+    m=$(( (r + 1) / 2 ))
+    offset=$(( (m - 1) * GROUP_COUNT / FWD_ROUNDS ))
+    group_list | awk -v off="$offset" -v n="$GROUP_COUNT" '
+        {a[NR]=$0} END { for (i=0;i<n;i++) print a[(off+i)%n+1] }'
+}
+
+round_desc() {
+    local r="$1" m
+    if [ $((r % 2)) -eq 0 ]; then
+        echo "第 $((r - 1)) 輪的完整反序"
+    else
+        m=$(( (r + 1) / 2 ))
+        echo "正向,起點偏移 $(( (m - 1) * GROUP_COUNT / FWD_ROUNDS ))"
+    fi
+}
+
+schedule_tsv() {
+    local r pos label
+    for r in $(seq 1 "$ROUNDS"); do
+        pos=0
+        for label in $(round_order "$r"); do
+            pos=$((pos + 1))
+            printf '%s\t%s\t%s\n' "$r" "$pos" "$label"
+        done
+    done
+}
+
+# 逐配對統計先後次數。
+#
+# **旋轉只均衡絕對位置,不均衡相對先後** —— 循環位移是保序的,配對 (A,B) 的先後
+# 只取決於環繞點有沒有落在它們之間,落不到就每一輪都是 A 在前。
+# 環境若有系統性的時間趨勢,那就成為只偏袒其中一方的偏差,而增加輪數消不掉它。
+#
+# 輪數為奇數時完全相等不可能,`ceil : floor` 即理論上界。
+check_order_balance() {
+    schedule_tsv | awk -v R="$ROUNDS" '
+        { pos[$1 SUBSEP $3] = $2; if ($1 == 1) { L[$2] = $3; if ($2 > n) n = $2 } }
+        END {
+            lo = int(R / 2); hi = R - lo
+            bad = 0; mn = R + 1; mx = -1
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) {
+                a = L[i]; b = L[j]; c = 0
+                for (r = 1; r <= R; r++) if (pos[r SUBSEP a] < pos[r SUBSEP b]) c++
+                if (c < mn) mn = c
+                if (c > mx) mx = c
+                if (c < lo || c > hi) {
+                    bad++
+                    printf "  失衡:%s 先於 %s 共 %d / %d 輪\n", a, b, c, R
+                }
+            }
+            printf "\n配對先後:最少 %d / 最多 %d(允許 %d～%d,共 %d 個配對)\n",
+                mn, mx, lo, hi, n * (n - 1) / 2
+            if (bad > 0) {
+                printf ">>> **排程有缺陷** —— %d 個配對的先後固定,\n", bad
+                printf "    環境若有時間趨勢,那些比較會被一致地偏移。\n"
+                exit 1
+            }
+            printf ">>> 排程均衡:所有配對的先後都在允許範圍內。\n"
+        }'
+}
+
 # 只解析不執行。**把「走一次預設路徑」從「開一次矩陣」變成一秒鐘的事。**
 #
 # 那條教訓的成本原本很高：驗證都會帶參數（為了縮小規模），而正式跑的是預設值，
@@ -163,7 +251,36 @@ if [ -n "${MATRIX_RESOLVE_ONLY:-}" ]; then
     done
     echo
     echo "組別 ${GROUP_COUNT} 個 × ${ROUNDS} 輪 = $((GROUP_COUNT * ROUNDS)) 次重啟"
-    exit 0
+    echo
+    echo "==================== 各輪排程 ===================="
+    for r in $(seq 1 "$ROUNDS"); do
+        printf '第 %s 輪(%s):%s\n' "$r" "$(round_desc "$r")" \
+            "$(round_order "$r" | tr '\n' ' ')"
+    done
+    echo
+    echo "==================== 絕對位置 ===================="
+    echo "反序解決先後,旋轉解決位置 —— **兩種偏差要同時處理**,"
+    echo "反序不得把旋轉原本解決的問題弄回來。"
+    schedule_tsv | awk -v R="$ROUNDS" '
+        { p[$3, $1] = $2; if ($1 == 1) { L[$2] = $3; if ($2 > n) n = $2 } }
+        END {
+            worst = 0
+            for (i = 1; i <= n; i++) {
+                line = ""; seen = 0; delete d
+                for (r = 1; r <= R; r++) {
+                    line = line sprintf("%3d", p[L[i], r])
+                    if (!(p[L[i], r] in d)) { d[p[L[i], r]] = 1; seen++ }
+                }
+                printf "  %-22s 各輪位置:%s   相異 %d / %d\n", L[i], line, seen, R
+                if (worst == 0 || seen < worst) worst = seen
+            }
+            printf "\n最少相異位置數:%d / %d 輪\n", worst, R
+        }'
+    echo
+    echo "==================== 先後均衡 ===================="
+    # **一次完整批次要數十分鐘,排程缺陷必須在付出那個成本之前就看得見。**
+    check_order_balance
+    exit $?
 fi
 
 # **先建一次 image。** 每組的 `up --force-recreate` 只重建容器,不重建 image ——
@@ -191,11 +308,9 @@ echo
 for r in $(seq 1 "$ROUNDS"); do
     # 旋轉：每一輪把起點往後推，讓每組落在不同位置。
     # **確定性的旋轉而非隨機打亂** —— 只有幾輪時，隨機無法保證位置分佈平均。
-    offset=$(( (r - 1) * GROUP_COUNT / ROUNDS ))
-    ordered=$(group_list | awk -v off="$offset" -v n="$GROUP_COUNT" '
-        {a[NR]=$0} END { for (i=0;i<n;i++) print a[(off+i)%n+1] }')
+    ordered=$(round_order "$r")
 
-    echo "########## 第 ${r} 輪（起點偏移 ${offset}）##########"
+    echo "########## 第 ${r} 輪（$(round_desc "$r")）##########"
     for label in $ordered; do
         parse_label "$label"
         st="$LABEL_STRATEGY"
