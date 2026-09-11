@@ -247,15 +247,18 @@ check_order_balance() {
 # 兩條是不同的路徑——`GROUPS` 是 bash 內建變數那次就是這樣躲過驗證的。
 # 檢查便宜到可以每次都做，它才真的會被做。
 if [ -n "${MATRIX_RESOLVE_ONLY:-}" ]; then
-    printf '%-22s %-8s %-14s %s\n' 組別 模型 准入上限 策略
+    printf '%-22s %-8s %-20s %s\n' 組別 模型 並行度旋鈕 策略
     for label in $(group_list); do
         parse_label "$label"
         # 虛擬執行緒不受 tomcat 執行緒上限約束 —— **印「200」會是一個不是事實的數字**，
         # 而條件表上錯誤的數字比缺漏的更危險：缺漏看得出來，錯誤看不出來。
+        # 數字的意義隨模型而異 —— 平台是准入上限,虛擬是 carrier 並行度。
         if [ "$LABEL_MODEL" = true ]; then
-            printf '%-22s %-8s %-14s %s\n' "$label" 虛擬 "不適用" "$LABEL_STRATEGY"
+            printf '%-22s %-8s %-20s %s\n' "$label" 虛擬 \
+                "carrier ${LABEL_THREADS:-4(預設)}" "$LABEL_STRATEGY"
         else
-            printf '%-22s %-8s %-14s %s\n' "$label" 平台 "${LABEL_THREADS:-200(預設)}" "$LABEL_STRATEGY"
+            printf '%-22s %-8s %-20s %s\n' "$label" 平台 \
+                "准入 ${LABEL_THREADS:-200(預設)}" "$LABEL_STRATEGY"
         fi
     done
     echo
@@ -325,8 +328,18 @@ for r in $(seq 1 "$ROUNDS"); do
         parse_label "$label"
         st="$LABEL_STRATEGY"
         vt="$LABEL_MODEL"
-        # 留空即用應用預設 200 —— 顯式帶 200 與先前「完全不設」的實際生效值相同。
-        tm="${LABEL_THREADS:-200}"
+        # **label 的數字 = 該模型的「並行度旋鈕」。**
+        #   平台 P<n> → Tomcat 執行緒數,決定**同時能放進來幾個請求**
+        #   虛擬 V<n> → carrier 並行度,決定**同時能有幾個真的在執行**
+        # 兩者是同一個概念的兩種實作,而它們在條件表上必須分開列 ——
+        # 平台的 CPU 配額是 CFS 配額(可超過 4 路並行),虛擬的 carrier 數是硬上限。
+        if [ "$vt" = true ]; then
+            tm=200                       # 對虛擬不生效,維持預設值
+            cp="${LABEL_THREADS:-}"      # 留空 = 不加參數 = JDK 預設(availableProcessors)
+        else
+            tm="${LABEL_THREADS:-200}"   # 留空即 200,與先前「完全不設」的生效值相同
+            cp=""                        # 對平台不生效,不設
+        fi
         group_start=$(date +%s)
         elapsed=$(( group_start - START_EPOCH ))
 
@@ -341,6 +354,7 @@ for r in $(seq 1 "$ROUNDS"); do
         # Flyway 不會重跑——症狀是 `relation "purchase_order" does not exist`。
         # depends_on 已設 condition: service_healthy，compose 會先起 postgres 再起 app。
         STRATEGY="$st" MAX_ATTEMPTS=100 POOL_SIZE=50 VIRTUAL_THREADS="$vt" TOMCAT_THREADS="$tm" \
+            CARRIER_PARALLELISM="$cp" \
             docker compose --profile perf up -d --force-recreate --wait postgres-perf app >/dev/null 2>&1
 
         # **准入上限取自應用自報,不取自我們剛才傳出去的值。**
@@ -423,6 +437,14 @@ for r in $(seq 1 "$ROUNDS"); do
             exit 1
         fi
 
+        # carrier 取窗口內的**最大值**,而且必須在負載跑完之後才讀 ——
+        # **carrier 是惰性建立的**,應用剛起來時只有幾條,要有足夠的併發才會長到上限。
+        # 實際踩到:原本把這行放在 `up --wait` 之後、負載之前,V16 因此報 6 而不是 16。
+        # 平台組態下為 0 —— **那是據實呈現「不適用」,不是量測失敗。**
+        car=$(docker compose --profile perf logs app 2>/dev/null \
+            | grep -oE 'carriers=[0-9]+' | cut -d= -f2 | sort -n | tail -1 || true)
+        car="${car:-?}"
+
         rps=$(grep -m1 '中位數' "$log" | grep -oE '[0-9.]+' || echo "")
         sold=$(grep -m1 '累計售出' "$log" | grep -oE '[0-9]+$' || echo "")
         over=$(grep -m1 '超賣張數' "$log" | grep -oE '[0-9]+$' || echo "")
@@ -446,9 +468,9 @@ for r in $(seq 1 "$ROUNDS"); do
             "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" "$adm" \
             "${appmem:-?}" "$cpu_app" "$cpu_asys" "$cpu_pg" "$cpu_psys" \
             "$pool_wait" "$pool_hold" >> "$RESULTS"
-        printf '  %-20s %10s req/s   准入=%-8s CPU app=%s pg=%s  池 等=%s 持=%s  t=%ss 售出=%-6s 超賣=%-6s 5xx=%s\n' \
-            "$label" "$rps" "$adm" "$cpu_app" "$cpu_pg" "$pool_wait" "$pool_hold" \
-            "$elapsed" "${sold:-?}" "${over:-?}" "${e5:-?}"
+        printf '  %-20s %10s req/s   准入=%-8s carrier=%-4s CPU app=%s pg=%s  池 等=%s 持=%s  t=%ss 5xx=%s\n' \
+            "$label" "$rps" "$adm" "$car" "$cpu_app" "$cpu_pg" "$pool_wait" "$pool_hold" \
+            "$elapsed" "${e5:-?}"
     done
     echo
 done

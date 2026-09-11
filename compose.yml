@@ -32,7 +32,14 @@ services:
     environment:
       # 不設的話 MaxRAMPercentage 預設 25%：2GB 的容器只有 512MB heap，
       # GC 頻繁到數據失真，而且不會有任何錯誤訊息。實測見 change 的 tasks。
-      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      # CARRIER_PARALLELISM 未指定時**完全不加該參數**，用 JDK 預設值
+      # （= availableProcessors）。既有批次的條件因此不受本支影響。
+      #
+      # **這是虛擬執行緒的「執行並行度上限」，而它是硬上限。**
+      # 對照之下 cpus: 4 是 CFS 配額（每 100ms 給 400ms CPU 時間）而**不是 CPU 集合**——
+      # 平台執行緒可以同時跑在主機的 10 個邏輯核上，只是配額消耗較快。
+      # 兩個模型在「同時能有幾個真的在執行」上並不對等，而那不在條件表裡。
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75${CARRIER_PARALLELISM:+ -Djdk.virtualThreadScheduler.parallelism=$CARRIER_PARALLELISM}"
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-perf:5432/ticket_rush_db
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: perf
