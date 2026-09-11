@@ -126,7 +126,7 @@ OUT_DIR=$(mktemp -d)
 RESULTS="$OUT_DIR/results.tsv"
 trap 'rm -rf "$OUT_DIR"' EXIT
 # dur_s 附在最後一欄 —— 前面幾欄的位置是統計用 awk 的 $2 / $3 / $4,不動它們。
-printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\tadmission\tapp_mem_pct\tcpu_app_ms\tcpu_app_sys_ms\tcpu_pg_ms\tcpu_pg_sys_ms\n' > "$RESULTS"
+printf 'label\tround\telapsed_s\trps\tsold\toversold\terr5xx\tdur_s\tadmission\tapp_mem_pct\tcpu_app_ms\tcpu_app_sys_ms\tcpu_pg_ms\tcpu_pg_sys_ms\tpool_wait_ms\tpool_hold_ms\n' > "$RESULTS"
 
 # 統計輔助:與 run-load-test.sh 使用完全相同的定義。
 # **全距一律為 (max-min)/median** —— 換分母就能讓任何修正看起來有效。
@@ -396,10 +396,15 @@ for r in $(seq 1 "$ROUNDS"); do
         # **判準加總,診斷逐容器。** 任一容器節流即整批不可用(加總判斷就夠),
         # 但輸出必須說得出是誰 —— 否則下一步會走錯方向(第 17 支即因此把瓶頸歸給 app,
         # 而實際上是 postgres,導致整支 change 的設計建立在錯的前提上)。
+        # 連線池:**等待取得**與**取得後持有**分開 —— 前者代表資源不夠或競爭者太多,
+        # 後者代表每次使用做的事比較多或比較慢,處置完全不同。
+        pool_wait=$(echo "$cpu_line" | sed -n 's/.*poolwait=\([0-9.]*\).*/\1/p')
+        pool_hold=$(echo "$cpu_line" | sed -n 's/.*poolhold=\([0-9.]*\).*/\1/p')
         thr_app=$(echo "$cpu_line" | sed -n 's/.*thr_app=\([0-9]*\).*/\1/p')
         thr_pg=$(echo "$cpu_line" | sed -n 's/.*thr_pg=\([0-9]*\).*/\1/p')
         cpu_thr=$(( ${thr_app:-0} + ${thr_pg:-0} ))
-        if [ -z "$cpu_app" ] || [ -z "$thr_app" ] || [ -z "$thr_pg" ]; then
+        if [ -z "$cpu_app" ] || [ -z "$thr_app" ] || [ -z "$thr_pg" ] \
+            || [ -z "$pool_wait" ] || [ -z "$pool_hold" ]; then
             echo
             echo ">>> **整批數據不可用** —— ${label}(第 ${r} 輪)沒有 CPU 摘要。"
             echo "    探針取不到數字時不得留空繼續:輸出少一欄看起來像 grep 寫錯,"
@@ -437,12 +442,13 @@ for r in $(seq 1 "$ROUNDS"); do
             tail -5 "$log" | sed 's/^/      /'
             exit 1
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$label" "$r" "$elapsed" "$rps" "${sold:-?}" "${over:-?}" "${e5:-?}" "$dur" "$adm" \
-            "${appmem:-?}" "$cpu_app" "$cpu_asys" "$cpu_pg" "$cpu_psys" >> "$RESULTS"
-        printf '  %-20s %10s req/s   准入=%-8s CPU app=%s(sys %s) pg=%s  t=%ss 耗時=%ss  售出=%-6s 超賣=%-6s 5xx=%s\n' \
-            "$label" "$rps" "$adm" "$cpu_app" "$cpu_asys" "$cpu_pg" \
-            "$elapsed" "$dur" "${sold:-?}" "${over:-?}" "${e5:-?}"
+            "${appmem:-?}" "$cpu_app" "$cpu_asys" "$cpu_pg" "$cpu_psys" \
+            "$pool_wait" "$pool_hold" >> "$RESULTS"
+        printf '  %-20s %10s req/s   准入=%-8s CPU app=%s pg=%s  池 等=%s 持=%s  t=%ss 售出=%-6s 超賣=%-6s 5xx=%s\n' \
+            "$label" "$rps" "$adm" "$cpu_app" "$cpu_pg" "$pool_wait" "$pool_hold" \
+            "$elapsed" "${sold:-?}" "${over:-?}" "${e5:-?}"
     done
     echo
 done
