@@ -112,6 +112,41 @@ read_cpu_stat() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 連線池探針。取應用定期輸出的累計值，窗口兩端各一次，相減。
+#
+# **等待取得** 與 **取得後持有** 分開：前者代表資源不夠或競爭者太多，
+# 後者代表每次使用做的事比較多或比較慢 —— 兩者對瓶頸的指認不同，處置也不同。
+# ---------------------------------------------------------------------------
+POOL_ACQ_N=""; POOL_ACQ_MS=""; POOL_USE_N=""; POOL_USE_MS=""
+read_pool_metrics() {
+    local line
+    line=$(docker compose --profile perf logs app 2>/dev/null | grep '連線池累計' | tail -1)
+    if [ -z "$line" ]; then
+        echo ">>> 讀不到連線池探針的輸出——**中止**。" >&2
+        echo "    app 的 TICKET_RUSH_POOL_METRICS_INTERVAL_MS 有設嗎？image 重建了嗎？" >&2
+        echo "    註：探針是量測協定的一部分，**沒有「關掉它照樣量」這條路徑**。" >&2
+        echo "    要評估探針本身的成本，把間隔拉長（例如 30000）而不是設為 0。" >&2
+        return 1
+    fi
+    # **NA 必須中止，不得當成 0。** meter 要到第一次取得連線才註冊，
+    # 而「沒有等待」與「沒量到」在數字上完全相同 —— 那正是這個探針最容易失效的方式。
+    case "$line" in
+        *acquire_count=NA*)
+            echo ">>> 連線池 meter 尚未註冊(NA)——**中止**。" >&2
+            return 1 ;;
+    esac
+    POOL_ACQ_N=$(echo "$line" | sed -n 's/.*acquire_count=\([0-9]*\).*/\1/p')
+    POOL_ACQ_MS=$(echo "$line" | sed -n 's/.*acquire_total_ms=\([0-9.]*\).*/\1/p')
+    POOL_USE_N=$(echo "$line" | sed -n 's/.*usage_count=\([0-9]*\).*/\1/p')
+    POOL_USE_MS=$(echo "$line" | sed -n 's/.*usage_total_ms=\([0-9.]*\).*/\1/p')
+    if [ -z "$POOL_ACQ_N" ] || [ -z "$POOL_ACQ_MS" ] || [ -z "$POOL_USE_N" ] || [ -z "$POOL_USE_MS" ]; then
+        echo ">>> 連線池探針的輸出解析失敗——**中止**。原始行：" >&2
+        echo "    $line" >&2
+        return 1
+    fi
+}
+
 # 資料目錄中某個子目錄的大小，供診斷用。**這是資訊，不是判準。**
 pg_dir_size() {
     docker compose --profile perf exec -T postgres-perf \
@@ -365,6 +400,7 @@ DRAIN_MS=0
 APP_USAGE_D=0; APP_USER_D=0; APP_SYS_D=0; APP_THR_D=0
 PG_USAGE_D=0;  PG_USER_D=0;  PG_SYS_D=0;  PG_THR_D=0
 WALL_D=0; TOTAL_REQ=0; APP_QUOTA=0; PG_QUOTA=0
+POOL_ACQ_N_D=0; POOL_ACQ_MS_D=0; POOL_USE_N_D=0; POOL_USE_MS_D=0
 
 for i in $(seq 1 "$RUNS"); do
     echo "===== 量測 ${i}/${RUNS} ====="
@@ -374,6 +410,9 @@ for i in $(seq 1 "$RUNS"); do
     a0u=$CPU_USAGE; a0s=$CPU_USER; a0y=$CPU_SYS; a0t=$CPU_THROTTLED; APP_QUOTA=$CPU_QUOTA
     read_cpu_stat postgres-perf
     p0u=$CPU_USAGE; p0s=$CPU_USER; p0y=$CPU_SYS; p0t=$CPU_THROTTLED; PG_QUOTA=$CPU_QUOTA
+    # 連線池的基準點必須在暖機之後 —— 暖機會狂打連線池，包進來會主宰整個數字。
+    read_pool_metrics
+    q0n=$POOL_ACQ_N; q0m=$POOL_ACQ_MS; u0n=$POOL_USE_N; u0m=$POOL_USE_MS
     w0=$(date +%s)
 
     run_k6 "$TMPDIR_RUN/run_$i.log"
@@ -386,6 +425,12 @@ for i in $(seq 1 "$RUNS"); do
     read_cpu_stat postgres-perf
     PG_USAGE_D=$((PG_USAGE_D + CPU_USAGE - p0u));   PG_USER_D=$((PG_USER_D + CPU_USER - p0s))
     PG_SYS_D=$((PG_SYS_D + CPU_SYS - p0y));         PG_THR_D=$((PG_THR_D + CPU_THROTTLED - p0t))
+    read_pool_metrics
+    POOL_ACQ_N_D=$((POOL_ACQ_N_D + POOL_ACQ_N - q0n))
+    POOL_USE_N_D=$((POOL_USE_N_D + POOL_USE_N - u0n))
+    # 毫秒是小數，交給 awk 累加（bash 只有整數運算）。
+    POOL_ACQ_MS_D=$(awk -v a="$POOL_ACQ_MS_D" -v b="$POOL_ACQ_MS" -v c="$q0m" 'BEGIN{printf "%.3f", a+b-c}')
+    POOL_USE_MS_D=$(awk -v a="$POOL_USE_MS_D" -v b="$POOL_USE_MS" -v c="$u0m" 'BEGIN{printf "%.3f", a+b-c}')
     WALL_D=$((WALL_D + w1 - w0)); TOTAL_REQ=$((TOTAL_REQ + VUS * ITERATIONS))
 
     LAST_LOG="$TMPDIR_RUN/run_$i.log"
@@ -418,6 +463,35 @@ awk -v au="$APP_USAGE_D" -v as="$APP_USER_D" -v ay="$APP_SYS_D" \
 }'
 # **節流要能否決這一組。** 撞到配額時吞吐是被上限決定的，不是被被測特性決定的，
 # 而症狀只是「數字比預期低」，與真實的效能差異分不出來。
+echo
+echo "===== 連線池 ====="
+# **每個請求必然取得一次連線 —— 取得次數為 0 代表取樣點沒有涵蓋量測窗口。**
+#
+# NA 只擋得住「標記不存在」,擋不住「標記太舊」:取樣間隔若長於窗口,
+# 前後兩點會是同一行,差值為 0 —— 而 0 與「完全沒有等待」在數字上完全相同。
+# 實際踩到:以 30 秒間隔做探針成本對照時,池的欄位全是 0.0000 而沒有任何警告。
+if [ "$POOL_ACQ_N_D" -le 0 ]; then
+    echo ">>> 連線池取得次數為 0,而本次量測送出了 ${TOTAL_REQ} 個請求——**中止**。" >&2
+    echo "    每個請求都必然取得一次連線,因此這代表取樣點沒有涵蓋量測窗口" >&2
+    echo "    (取樣間隔太長?)。**輸出 0 會與「完全沒有等待」無法區分。**" >&2
+    exit 1
+fi
+# **等待與持有分開。** 「等很久」代表資源不夠或競爭者太多;
+# 「拿到之後佔很久」代表每次使用做的事比較多或比較慢 —— 處置完全不同。
+#
+# **持有時間必須與 postgres CPU 對照著看:**
+#   持有 ≈ postgres CPU → 連線被佔著的期間都在做事
+#   持有 ≫ postgres CPU → **連線被佔著卻沒在做事**（等鎖、等網路、等應用端處理）
+# 只看持有時間分不出這兩者,而它們是完全不同的問題。
+awk -v an="$POOL_ACQ_N_D" -v am="$POOL_ACQ_MS_D" -v un="$POOL_USE_N_D" -v um="$POOL_USE_MS_D" \
+    -v req="$TOTAL_REQ" -v pgcpu="$PG_USAGE_D" 'BEGIN {
+    printf "等待取得      : %.4f 毫秒/請求（取得 %d 次，每請求 %.2f 次）\n", am/req, an, an/req
+    printf "取得後持有    : %.4f 毫秒/請求\n", um/req
+    printf "對照          : postgres CPU %.4f 毫秒/請求", pgcpu/req/1000
+    if (um > 0) printf "   持有 / CPU = %.1f 倍", (um/req) / (pgcpu/req/1000)
+    printf "\n"
+}'
+echo
 printf 'CPU 節流      : app %s 次 / postgres %s 次' "$APP_THR_D" "$PG_THR_D"
 if [ "$APP_THR_D" -gt 0 ] || [ "$PG_THR_D" -gt 0 ]; then
     printf '   >>> **本組不得用於比較** —— 量測期間撞到 CPU 配額\n'
@@ -435,9 +509,14 @@ fi
 # 於是我寫下「無鎖層把 app 的 4 核跑滿」並據此設計了一整支 change ——
 # 而那 101 次幾乎全是 postgres 的,app 全程只用 25～37%。**降載因此完全無效。**
 awk -v au="$APP_USAGE_D" -v ay="$APP_SYS_D" -v pu="$PG_USAGE_D" -v py="$PG_SYS_D" \
-    -v req="$TOTAL_REQ" -v ta="$APP_THR_D" -v tp="$PG_THR_D" 'BEGIN {
-    printf "CPU 摘要      : app=%.3f app_sys=%.3f pg=%.3f pg_sys=%.3f thr_app=%d thr_pg=%d\n",
+    -v req="$TOTAL_REQ" -v ta="$APP_THR_D" -v tp="$PG_THR_D" \
+    -v qm="$POOL_ACQ_MS_D" -v um="$POOL_USE_MS_D" 'BEGIN {
+    printf "CPU 摘要      : app=%.3f app_sys=%.3f pg=%.3f pg_sys=%.3f thr_app=%d thr_pg=%d",
         au/req/1000, ay/req/1000, pu/req/1000, py/req/1000, ta, tp
+    # **欄位名不可與既有的 app= / pg= 共用前綴。** `.*app=` 的貪婪比對會抓到最後一個 ——
+    # 第 18 支加 thr_app= 就讓 app= 抓錯,症狀是 CPU 數字全變 0。
+    # 因此用 poolwait= / poolhold=,與現有任何欄位都不重疊。
+    printf " poolwait=%.4f poolhold=%.4f\n", qm/req, um/req
 }'
 if [ "$RUNS" -eq 1 ]; then
     echo "    （只量了一次，全距 0 代表「沒有可信度資訊」，不代表穩定）"
